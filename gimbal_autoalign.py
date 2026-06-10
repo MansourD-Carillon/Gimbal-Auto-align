@@ -955,7 +955,7 @@ class GimbalController:
         print("Parked at the strongest measured VNA direction.")
         self.run_keyboard_control(start_h=best_h, start_v=best_v)
 
-    def run_velocity_scan(self, kv=1.5, v_min=1.0, v_max=30.0,
+    def run_velocity_scan(self, kv=1.5, v_min=1.0, v_max=14.6,
                           poll_interval=0.05, tolerance=0.1, plot=True):
         """Proportional-velocity VNA scan + precision park at the measured peak.
 
@@ -990,6 +990,10 @@ class GimbalController:
         def _vel(angle, hint):
             return _clamp(kv * abs(angle - hint), v_min, v_max)
 
+        def _scan_aborted():
+            k = ctypes.windll.user32.GetAsyncKeyState
+            return bool(k(0x51) & 0x8000) or bool(k(0x1B) & 0x8000)  # Q or ESC
+
         print(f"\nPhase 1: H sweep  hint={target_h:.2f}°  "
               f"vel = clamp({kv}×|H−{target_h:.1f}°|, {v_min}, {v_max}) dps")
 
@@ -1016,6 +1020,11 @@ class GimbalController:
         mbx.move_pos(mbx.H, h_goal_pos)
 
         while True:
+            if _scan_aborted():
+                print("\n*** Scan aborted (Q/ESC) ***")
+                mbx.set_velocity(0, 0, 0)
+                self.home()
+                return
             cur_h_pos = mbx.current_pos(mbx.H, 1)
             cur_h_ang = mbx.convertpostoangle(mbx.H, cur_h_pos)
             try:
@@ -1067,6 +1076,11 @@ class GimbalController:
         mbx.move_pos(mbx.V, v_goal_pos)
 
         while True:
+            if _scan_aborted():
+                print("\n*** Scan aborted (Q/ESC) ***")
+                mbx.set_velocity(0, 0, 0)
+                self.home()
+                return
             cur_v_pos = mbx.current_pos(mbx.V, 1)
             cur_v_ang = mbx.convertpostoangle(mbx.V, cur_v_pos)
             try:
@@ -1339,7 +1353,7 @@ class GimbalController:
     # ------------------------------------------------------------------------------------------------------------------
 
     def move_with_pid(self, h=None, v=None,
-                      kv=1.5, v_min=1.0, v_max=30.0,
+                      kv=1.5, v_min=1.0, v_max=14.6,
                       tolerance=0.1, max_time=30.0,
                       poll_interval=0.05, plot=True, verbose=True):
         """Move to (h, v) with velocity-proportional position correction, then fine-settle.
@@ -1466,15 +1480,16 @@ class GimbalController:
     def tune_velocity_controller(self,
                                   start_h=40.0, start_v=20.0,
                                   target_h=0.0, target_v=0.0,
-                                  max_trials=60):
-        """Auto-tune kv, v_min, v_max for move_with_pid by running real hardware moves.
+                                  max_trials=30):
+        """Auto-tune kv for move_with_pid by running real hardware moves.
 
-        Moves from (start_h, start_v) to (target_h, target_v) repeatedly with different
-        parameter candidates, measuring settling time and overshoot each trial.
+        v_min and v_max are fixed (1.0 and 14.6) — only kv changes settling behaviour.
+        Moves from (start_h, start_v) to (target_h, target_v) repeatedly,
+        measuring settling time and overshoot each trial.
         Uses scipy Nelder-Mead if available; falls back to a two-pass grid search.
 
-        Each trial takes ~10-25 s on hardware; 60 trials ≈ 15-25 minutes total.
-        Prints the best-found values at the end — paste them into run_velocity_scan().
+        Each trial takes ~10-25 s on hardware; 30 trials ≈ 5-12 minutes total.
+        Prints the best-found kv at the end — paste it into run_velocity_scan().
 
         # ================================================================
         # TUNER — comment out the call site in __main__ after use.
@@ -1482,13 +1497,15 @@ class GimbalController:
         """
         self._require_connection()
 
+        V_MIN = 1.0
+        V_MAX = 14.6
+
         trial_num = [0]
         best_cost = [float("inf")]
-        best_params = [1.5, 1.0, 30.0]   # [kv, v_min, v_max] starting guess
+        best_kv   = [1.5]
         TSEP = "=" * 62
 
         def _overshoot(errors):
-            """Return the max magnitude of any error sample that crossed zero (overshoot)."""
             if len(errors) < 2:
                 return 0.0
             sign0 = 1 if errors[0] >= 0 else -1
@@ -1497,35 +1514,31 @@ class GimbalController:
                 default=0.0,
             )
 
-        def _eval(kv, v_min, v_max):
-            kv    = max(0.2, min(10.0, float(kv)))
-            v_min = max(0.1, min(5.0,  float(v_min)))
-            v_max = max(v_min + 0.5, min(80.0, float(v_max)))
+        def _eval(kv):
+            kv = max(0.2, min(10.0, float(kv)))
 
             trial_num[0] += 1
-            print(f"\n[Trial {trial_num[0]:3d}/{max_trials}]  "
-                  f"kv={kv:.4f}  v_min={v_min:.4f}  v_max={v_max:.4f}")
+            print(f"\n[Trial {trial_num[0]:3d}/{max_trials}]  kv={kv:.4f}")
 
             mbx.move_angle(hang=start_h, vang=start_v, accuracy="HIGH")
             time.sleep(0.2)
 
             log = self.move_with_pid(
                 h=target_h, v=target_v,
-                kv=kv, v_min=v_min, v_max=v_max,
+                kv=kv, v_min=V_MIN, v_max=V_MAX,
                 tolerance=0.1, max_time=30.0,
                 plot=False, verbose=False,
             )
 
-            t_data  = log["t"]
-            h_err   = log["h_error"]
-            v_err   = log["v_error"]
+            t_data = log["t"]
+            h_err  = log["h_error"]
+            v_err  = log["v_error"]
 
             settling_time = t_data[-1] if t_data else 30.0
             h_over        = _overshoot(h_err)
             v_over        = _overshoot(v_err)
             final_err     = abs(h_err[-1]) + abs(v_err[-1]) if h_err else 99.0
 
-            # Cost: penalise slow settling, overshoot, and residual error
             cost = settling_time + 5.0 * (h_over + v_over) + 20.0 * final_err
             print(f"           cost={cost:.3f}  "
                   f"(settle={settling_time:.2f}s  "
@@ -1533,16 +1546,17 @@ class GimbalController:
                   f"final_err={final_err:.4f}°)")
 
             if cost < best_cost[0]:
-                best_cost[0]  = cost
-                best_params[:] = [kv, v_min, v_max]
+                best_cost[0] = cost
+                best_kv[0]   = kv
                 print(f"           *** new best ***")
 
             return cost
 
         print(f"\n{TSEP}")
-        print("  VELOCITY CONTROLLER TUNER")
+        print("  VELOCITY CONTROLLER TUNER  (kv only)")
         print(f"  Start  : H={start_h}°  V={start_v}°")
         print(f"  Target : H={target_h}°  V={target_v}°")
+        print(f"  Fixed  : v_min={V_MIN}  v_max={V_MAX}")
         print(f"  Max trials: {max_trials}  (~{max_trials * 18 // 60}-{max_trials * 25 // 60} min)")
         print(TSEP)
 
@@ -1551,47 +1565,32 @@ class GimbalController:
             print("scipy found — using Nelder-Mead optimiser.\n")
 
             _sp_minimize(
-                lambda p: _eval(p[0], p[1], p[2]),
-                x0=[1.5, 1.0, 30.0],
+                lambda p: _eval(p[0]),
+                x0=[1.5],
                 method="Nelder-Mead",
                 options={
                     "maxiter": max_trials,
                     "xatol": 0.05,
                     "fatol": 0.5,
-                    "adaptive": True,
                 },
             )
 
         except ImportError:
             print("scipy not found — using two-pass grid search.\n")
 
-            # Coarse pass: 5×3×3 = 45 points
-            for kv in (0.5, 1.0, 1.5, 2.5, 4.0):
-                for vn in (0.5, 1.0, 2.0):
-                    for vx in (15.0, 30.0, 50.0):
-                        _eval(kv, vn, vx)
-                        if trial_num[0] >= max_trials:
-                            break
-                    if trial_num[0] >= max_trials:
-                        break
+            # Coarse pass: 8 kv candidates
+            for kv in (0.3, 0.5, 0.8, 1.2, 1.5, 2.0, 3.0, 5.0):
+                _eval(kv)
                 if trial_num[0] >= max_trials:
                     break
 
-            # Fine pass: 3×3×3 = 27 points around the current best
+            # Fine pass: 5 points around the best kv
             if trial_num[0] < max_trials:
-                bkv, bvn, bvx = best_params
-                for kv in (bkv * 0.75, bkv, bkv * 1.25):
-                    for vn in (max(0.1, bvn * 0.75), bvn, bvn * 1.25):
-                        for vx in (bvx * 0.75, bvx, bvx * 1.25):
-                            _eval(kv, vn, vx)
-                            if trial_num[0] >= max_trials:
-                                break
-                        if trial_num[0] >= max_trials:
-                            break
+                bkv = best_kv[0]
+                for kv in (bkv * 0.6, bkv * 0.8, bkv, bkv * 1.2, bkv * 1.5):
+                    _eval(kv)
                     if trial_num[0] >= max_trials:
                         break
-
-        kv_best, v_min_best, v_max_best = best_params
 
         print(f"\n{TSEP}")
         print("  TUNING COMPLETE")
@@ -1599,16 +1598,14 @@ class GimbalController:
         print(f"  Best cost  : {best_cost[0]:.3f}")
         print(TSEP)
         print()
-        print("  *** TUNED VELOCITY CONTROLLER PARAMETERS ***")
-        print(f"      kv     = {kv_best:.4f}    # dps per degree of error")
-        print(f"      v_min  = {v_min_best:.4f}    # minimum motor velocity (dps)")
-        print(f"      v_max  = {v_max_best:.4f}    # maximum motor velocity (dps)")
+        print("  *** TUNED VELOCITY CONTROLLER PARAMETER ***")
+        print(f"      kv = {best_kv[0]:.4f}    # proportional gain (velocity per degree of error)")
         print()
-        print("  Paste these into run_velocity_scan() / move_with_pid() calls:")
-        print(f"      kv={kv_best:.4f}, v_min={v_min_best:.4f}, v_max={v_max_best:.4f}")
+        print("  Paste into run_velocity_scan() / move_with_pid() calls:")
+        print(f"      kv={best_kv[0]:.4f}")
         print(TSEP)
 
-        return kv_best, v_min_best, v_max_best
+        return best_kv[0]
 
     @staticmethod
     def _plot_pid_results(log):
@@ -1787,7 +1784,7 @@ if __name__ == "__main__":
         print("  5 - 2D sweep to find the VNA peak")
         print("  6 - Adaptive-speed sweep around a proposed best angle")
         print("  7 - Proportional-velocity VNA scan + precision park at measured peak")
-        print("  8 - Tune velocity controller (kv / v_min / v_max) — no VNA needed")
+        print("  8 - Tune velocity controller (kv) — no VNA needed")
         choice = input("Enter 1-8: ").strip()
         if choice in ("1", "2", "3", "4", "5", "6", "7", "8"):
             break
