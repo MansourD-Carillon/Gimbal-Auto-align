@@ -998,10 +998,10 @@ class GimbalController:
         except Exception:
             pass
 
-        mbx.move_angle(vang=0.0, hang=-180.0, accuracy="HIGH")
+        mbx.move_angle(vang=0.0, hang=-270.0, accuracy="HIGH")
         time.sleep(0.1)
 
-        best_h = -180.0
+        best_h = -270.0
         best_v = 0.0
         best_db = float("-inf")
         h_scan_ang = []
@@ -1011,8 +1011,8 @@ class GimbalController:
         if done_tol_h < 1:
             done_tol_h = 1
 
-        h_goal_pos = mbx.convertangletopos(mbx.H, 180.0)
-        mbx.set_velocity(_vel(-180.0, target_h), 0, 0)
+        h_goal_pos = mbx.convertangletopos(mbx.H, 90.0)
+        mbx.set_velocity(_vel(-270.0, target_h), 0, 0)
         mbx.move_pos(mbx.H, h_goal_pos)
 
         last_vel_h = None
