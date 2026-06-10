@@ -1787,10 +1787,11 @@ if __name__ == "__main__":
         print("  5 - 2D sweep to find the VNA peak")
         print("  6 - Adaptive-speed sweep around a proposed best angle")
         print("  7 - Proportional-velocity VNA scan + precision park at measured peak")
-        choice = input("Enter 1, 2, 3, 4, 5, 6, or 7: ").strip()
-        if choice in ("1", "2", "3", "4", "5", "6", "7"):
+        print("  8 - Tune velocity controller (kv / v_min / v_max) — no VNA needed")
+        choice = input("Enter 1-8: ").strip()
+        if choice in ("1", "2", "3", "4", "5", "6", "7", "8"):
             break
-        print("Invalid input -- enter 1, 2, 3, 4, 5, 6, or 7.")
+        print("Invalid input -- enter a number from 1 to 8.")
 
     def _attach_vna(gim):
         if SIMULATE_VNA:
@@ -1817,5 +1818,29 @@ if __name__ == "__main__":
         elif choice == "7":
             _attach_vna(gim)
             gim.run_velocity_scan()
+        elif choice == "8":
+            try:
+                sh = float(input("Start H angle for tuning trials (degrees) [default 40]: ").strip() or "40")
+            except Exception:
+                sh = 40.0
+            try:
+                sv = float(input("Start V angle for tuning trials (degrees) [default 20]: ").strip() or "20")
+            except Exception:
+                sv = 20.0
+            try:
+                th = float(input("Target H angle (degrees) [default 0]: ").strip() or "0")
+            except Exception:
+                th = 0.0
+            try:
+                tv = float(input("Target V angle (degrees) [default 0]: ").strip() or "0")
+            except Exception:
+                tv = 0.0
+            try:
+                nt = int(input("Max trials [default 60]: ").strip() or "60")
+            except Exception:
+                nt = 60
+            gim.tune_velocity_controller(start_h=sh, start_v=sv,
+                                          target_h=th, target_v=tv,
+                                          max_trials=nt)
         else:
             gim.run_keyboard_control()
