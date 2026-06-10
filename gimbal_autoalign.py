@@ -1,3 +1,18 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+# gimbal_autoalign.py  -- SINGLE-FILE runnable script.
+#
+# GIM04 gimbal control + closed-loop, direct-motion beam alignment using VNA feedback.
+# The traditional step/grid scan is still available (mode 3); mode 4 is the closed-loop
+# direct-motion alignment (no full sweep, <= 5 correction passes).
+#
+# This script imports the stock MilliBox modules (mbx_functions, mbx_instrument) that are
+# already installed on the system; everything else (the alignment algorithm and the
+# controller) lives in THIS file, so only this one file needs to be run.
+#
+# Run:  python gimbal_autoalign.py mn
+
 import sys
 import atexit
 import ctypes
@@ -495,6 +510,36 @@ def beam_align_directmotion(inst, **kwargs):
     else:
         print("*** ERROR: unknown gimbal type")
         return None, None
+
+
+# ######################################################################################################################
+# #  SOFTWARE PID CONTROLLER
+# ######################################################################################################################
+
+class PIDController:
+    """Discrete-time PID with anti-windup for one axis."""
+
+    def __init__(self, kp=1.5, ki=0.05, kd=0.3, max_integral=5.0):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.max_integral = max_integral
+        self._integral = 0.0
+        self._prev_error = 0.0
+
+    def reset(self):
+        self._integral = 0.0
+        self._prev_error = 0.0
+
+    def compute(self, error, dt):
+        dt = max(dt, 1e-3)
+        self._integral = _clamp(
+            self._integral + error * dt,
+            -self.max_integral, self.max_integral,
+        )
+        derivative = (error - self._prev_error) / dt
+        self._prev_error = error
+        return self.kp * error + self.ki * self._integral + self.kd * derivative
 
 
 # ######################################################################################################################
@@ -1062,96 +1107,6 @@ class GimbalController:
         finally:
             csvplot.close()
 
-    def run_pid_continuous(self, kp=2.0, ki=0.02, kd=0.3,
-                           probe_deg=2.0, max_correction=5.0):
-        """PID gradient tracker: continuously steer toward the VNA power peak and print each measurement.
-
-        Treats the estimated power gradient (dP/dAngle) as the PID error signal.
-        At the beam peak the gradient is zero; the controller drives toward zero gradient.
-        Q/ESC to stop.
-        """
-        self._require_connection()
-        if self._vna is None:
-            raise RuntimeError("VNA not connected — call connect_vna() first")
-
-        _k = ctypes.windll.user32.GetAsyncKeyState
-        def held(vk): return bool(_k(vk) & 0x8000)
-
-        lo_h, hi_h = _angle_limits(H)
-        lo_v, hi_v = _angle_limits(V)
-        h = _clamp(_read_angle(H), lo_h, hi_h)
-        v = _clamp(_read_angle(V), lo_v, hi_v)
-
-        int_h = int_v = 0.0
-        prev_grad_h = prev_grad_v = 0.0
-        t_prev = time.time()
-
-        print("\nPID continuous measurement tracking  (Q/ESC to quit & home)")
-        print(f"  Kp={kp}  Ki={ki}  Kd={kd}  probe={probe_deg} deg  max_corr={max_correction} deg")
-        print(f"\n{'Iter':>5}  {'H deg':>9}  {'V deg':>9}  {'P dB':>9}  "
-              f"{'grad_H':>9}  {'grad_V':>9}  {'corr_H':>8}  {'corr_V':>8}")
-        print("-" * 85)
-
-        iteration = 0
-        while True:
-            if held(0x51) or held(0x1B):   # Q or ESC
-                break
-
-            iteration += 1
-            t_now = time.time()
-            dt = max(t_now - t_prev, 1e-3)
-            t_prev = t_now
-
-            # Center measurement
-            mbx.move_angle(hang=h, vang=v, accuracy="HIGH")
-            p0 = self._align_measure()
-
-            # H gradient — probe +/- probe_deg around current H
-            h_p = _clamp(h + probe_deg, lo_h, hi_h)
-            h_m = _clamp(h - probe_deg, lo_h, hi_h)
-            mbx.move_angle(hang=h_p, vang=v, accuracy="HIGH")
-            p_hp = self._align_measure()
-            mbx.move_angle(hang=h_m, vang=v, accuracy="HIGH")
-            p_hm = self._align_measure()
-
-            # V gradient — probe +/- probe_deg around current V
-            v_p = _clamp(v + probe_deg, lo_v, hi_v)
-            v_m = _clamp(v - probe_deg, lo_v, hi_v)
-            mbx.move_angle(hang=h, vang=v_p, accuracy="HIGH")
-            p_vp = self._align_measure()
-            mbx.move_angle(hang=h, vang=v_m, accuracy="HIGH")
-            p_vm = self._align_measure()
-
-            # Gradient estimates (dB/deg)
-            g_h = ((p_hp - p_hm) / (2.0 * probe_deg)
-                   if p_hp is not None and p_hm is not None else 0.0)
-            g_v = ((p_vp - p_vm) / (2.0 * probe_deg)
-                   if p_vp is not None and p_vm is not None else 0.0)
-
-            # PID update  (gradient is the error; target = 0 at the peak)
-            int_h = _clamp(int_h + g_h * dt, -30.0, 30.0)   # anti-windup clamp
-            int_v = _clamp(int_v + g_v * dt, -30.0, 30.0)
-            deriv_h = (g_h - prev_grad_h) / dt
-            deriv_v = (g_v - prev_grad_v) / dt
-
-            corr_h = _clamp(kp * g_h + ki * int_h + kd * deriv_h,
-                            -max_correction, max_correction)
-            corr_v = _clamp(kp * g_v + ki * int_v + kd * deriv_v,
-                            -max_correction, max_correction)
-
-            h = _clamp(h + corr_h, lo_h, hi_h)
-            v = _clamp(v + corr_v, lo_v, hi_v)
-            mbx.move_angle(hang=h, vang=v, accuracy="HIGH")
-
-            prev_grad_h = g_h
-            prev_grad_v = g_v
-
-            print(f"{iteration:5d}  {h:+9.3f}  {v:+9.3f}  {_fmt(p0):>9}  "
-                  f"{g_h:+9.4f}  {g_v:+9.4f}  {corr_h:+8.3f}  {corr_v:+8.3f}")
-
-        print("\nPID tracking stopped.")
-        self.home()
-
     def run_keyboard_control(self, start_h=0.0, start_v=0.0):
         self._require_connection()
 
@@ -1233,6 +1188,177 @@ class GimbalController:
         v = mbx.convertpostoangle(mbx.V, mbx.current_pos(mbx.V, 1))
         return {"H": h, "V": v}
 
+    # ------------------------------------------------------------------------------------------------------------------
+    #  PID-CONTROLLED MOVE
+    # ------------------------------------------------------------------------------------------------------------------
+
+    def move_with_pid(self, h=None, v=None,
+                      kp=1.5, ki=0.05, kd=0.3,
+                      tolerance=0.1, max_time=30.0,
+                      poll_interval=0.05, plot=True):
+        """Move to (h, v) with a software PID outer loop that continuously corrects residual
+        position error throughout the move.
+
+        The motor's internal firmware servo loop handles fast dynamics; this outer PID issues
+        corrective setpoint updates every *poll_interval* seconds to cancel steady-state error
+        caused by backlash, friction, or step quantisation.
+
+        Prints a live table to the terminal and, on completion, optionally renders a 4-panel
+        matplotlib plot (actual vs target position + error, both axes).  Returns the log dict.
+        """
+        self._require_connection()
+        if h is None and v is None:
+            raise ValueError("At least one of h or v must be provided")
+        if h is not None:
+            self._validate_angle("H", h)
+        if v is not None:
+            self._validate_angle("V", v)
+
+        pos = self.position()
+        h_target = float(h) if h is not None else pos["H"]
+        v_target = float(v) if v is not None else pos["V"]
+
+        pid_h = PIDController(kp, ki, kd)
+        pid_v = PIDController(kp, ki, kd)
+
+        log = {
+            "t": [], "h_actual": [], "v_actual": [],
+            "h_error": [], "v_error": [],
+            "h_target": h_target, "v_target": v_target,
+        }
+
+        SEP = "─" * 72
+        print(f"\n{SEP}")
+        print(f"  PID MOVE  →  H={h_target:.3f}°  V={v_target:.3f}°")
+        print(f"  Kp={kp}  Ki={ki}  Kd={kd}  tol=±{tolerance}°  poll={poll_interval}s")
+        print(SEP)
+        print(f"{'t(s)':>7}  {'H actual':>10}  {'H error':>9}  {'V actual':>10}  {'V error':>9}")
+        print(SEP)
+
+        # Kick off a non-blocking move toward the target
+        mbx.set_velocity(0, 0, 0)  # 0 → maximum velocity
+        h_steps = mbx.convertangletopos(mbx.H, h_target)
+        v_steps = mbx.convertangletopos(mbx.V, v_target)
+        mbx.move_pos(mbx.H, h_steps)
+        mbx.move_pos(mbx.V, v_steps)
+
+        t0 = time.time()
+        prev_t = t0
+        settled = 0
+
+        while True:
+            now = time.time()
+            elapsed = now - t0
+            dt = now - prev_t
+            prev_t = now
+
+            h_act = mbx.convertpostoangle(mbx.H, mbx.current_pos(mbx.H, 1))
+            v_act = mbx.convertpostoangle(mbx.V, mbx.current_pos(mbx.V, 1))
+            h_err = h_target - h_act
+            v_err = v_target - v_act
+
+            log["t"].append(elapsed)
+            log["h_actual"].append(h_act)
+            log["v_actual"].append(v_act)
+            log["h_error"].append(h_err)
+            log["v_error"].append(v_err)
+
+            print(
+                f"{elapsed:7.2f}  {h_act:+10.3f}°  {h_err:+9.3f}°"
+                f"  {v_act:+10.3f}°  {v_err:+9.3f}°"
+            )
+
+            within_tol = abs(h_err) <= tolerance and abs(v_err) <= tolerance
+            if within_tol:
+                settled += 1
+                if settled >= 5:
+                    print(f"\n  Converged: H_err={h_err:+.4f}°  V_err={v_err:+.4f}°"
+                          f"  t={elapsed:.2f}s")
+                    break
+            else:
+                settled = 0
+                # PID correction: nudge the commanded setpoint toward target
+                h_lo, h_hi = _angle_limits(H)
+                v_lo, v_hi = _angle_limits(V)
+                h_cmd = _clamp(h_target + pid_h.compute(h_err, dt), h_lo, h_hi)
+                v_cmd = _clamp(v_target + pid_v.compute(v_err, dt), v_lo, v_hi)
+                mbx.move_pos(mbx.H, mbx.convertangletopos(mbx.H, h_cmd))
+                mbx.move_pos(mbx.V, mbx.convertangletopos(mbx.V, v_cmd))
+
+            if elapsed >= max_time:
+                print(f"\n  Timeout after {max_time}s. "
+                      f"Residual: H={h_err:+.3f}°  V={v_err:+.3f}°")
+                break
+
+            time.sleep(poll_interval)
+
+        # Final high-accuracy blocking settle to leave motor firmly on target
+        mbx.move_angle(hang=h_target, vang=v_target, accuracy="HIGH")
+        self._print_position()
+        print(f"{SEP}\n")
+
+        if plot:
+            self._plot_pid_results(log)
+
+        return log
+
+    @staticmethod
+    def _plot_pid_results(log):
+        import matplotlib.pyplot as plt
+
+        t = log["t"]
+        h_tgt = log["h_target"]
+        v_tgt = log["v_target"]
+
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+        fig.suptitle(
+            f"PID Move  →  H={h_tgt:.3f}°  V={v_tgt:.3f}°",
+            fontsize=13, fontweight="bold",
+        )
+
+        # --- H position ---
+        ax = axes[0, 0]
+        ax.plot(t, log["h_actual"], "b-", linewidth=1.5, label="Actual")
+        ax.axhline(h_tgt, color="r", linestyle="--", linewidth=1, label="Target")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Angle (°)")
+        ax.set_title("Azimuth (H) — Position")
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.4)
+
+        # --- V position ---
+        ax = axes[0, 1]
+        ax.plot(t, log["v_actual"], "g-", linewidth=1.5, label="Actual")
+        ax.axhline(v_tgt, color="r", linestyle="--", linewidth=1, label="Target")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Angle (°)")
+        ax.set_title("Elevation (V) — Position")
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.4)
+
+        # --- H error ---
+        ax = axes[1, 0]
+        ax.plot(t, log["h_error"], "b-", linewidth=1.5)
+        ax.fill_between(t, log["h_error"], alpha=0.15, color="b")
+        ax.axhline(0, color="k", linewidth=0.5)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Error (°)")
+        ax.set_title("Azimuth (H) — Error")
+        ax.grid(True, alpha=0.4)
+
+        # --- V error ---
+        ax = axes[1, 1]
+        ax.plot(t, log["v_error"], "g-", linewidth=1.5)
+        ax.fill_between(t, log["v_error"], alpha=0.15, color="g")
+        ax.axhline(0, color="k", linewidth=0.5)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Error (°)")
+        ax.set_title("Elevation (V) — Error")
+        ax.grid(True, alpha=0.4)
+
+        plt.tight_layout()
+        plt.show()
+
     def close(self):
         if self._connected:
             try:
@@ -1283,11 +1409,12 @@ if __name__ == "__main__":
         print("  3 - Autonomous VNA grid scan")
         print("  4 - Autonomous closed-loop DIRECT-MOTION alignment")
         print("  5 - 2D sweep to find the VNA peak")
-        print("  6 - PID continuous measurement tracking (live print, Q/ESC to stop)")
-        choice = input("Enter 1, 2, 3, 4, 5, or 6: ").strip()
-        if choice in ("1", "2", "3", "4", "5", "6"):
+        print("  6 - Adaptive-speed sweep around a proposed best angle")
+        print("  7 - PID-controlled move to a target angle (position + error plot)")
+        choice = input("Enter 1, 2, 3, 4, 5, 6, or 7: ").strip()
+        if choice in ("1", "2", "3", "4", "5", "6", "7"):
             break
-        print("Invalid input -- enter 1, 2, 3, 4, 5, or 6.")
+        print("Invalid input -- enter 1, 2, 3, 4, 5, 6, or 7.")
 
     def _attach_vna(gim):
         if SIMULATE_VNA:
@@ -1310,6 +1437,14 @@ if __name__ == "__main__":
             gim.run_scan()
         elif choice == "6":
             _attach_vna(gim)
-            gim.run_pid_continuous()
+            gim.run_adaptive_scan()
+        elif choice == "7":
+            try:
+                h_in = float(input("Target H angle (degrees): ").strip())
+                v_in = float(input("Target V angle (degrees): ").strip())
+            except ValueError:
+                print("Invalid input, defaulting to (0, 0).")
+                h_in, v_in = 0.0, 0.0
+            gim.move_with_pid(h=h_in, v=v_in)
         else:
             gim.run_keyboard_control()
