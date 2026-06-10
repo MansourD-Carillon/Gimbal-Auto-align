@@ -1,18 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-#
-# gimbal_autoalign.py  -- SINGLE-FILE runnable script.
-#
-# GIM04 gimbal control + closed-loop, direct-motion beam alignment using VNA feedback.
-# The traditional step/grid scan is still available (mode 3); mode 4 is the closed-loop
-# direct-motion alignment (no full sweep, <= 5 correction passes).
-#
-# This script imports the stock MilliBox modules (mbx_functions, mbx_instrument) that are
-# already installed on the system; everything else (the alignment algorithm and the
-# controller) lives in THIS file, so only this one file needs to be run.
-#
-# Run:  python gimbal_autoalign.py mn
-
 import sys
 import atexit
 import ctypes
@@ -955,7 +940,7 @@ class GimbalController:
         print("Parked at the strongest measured VNA direction.")
         self.run_keyboard_control(start_h=best_h, start_v=best_v)
 
-    def run_velocity_scan(self, kv=1.5, v_min=1.0, v_max=30.0,
+    def run_velocity_scan(self, kv=1.6, v_min=1.0, v_max=14.6,
                           poll_interval=0.05, tolerance=0.1, plot=True):
         """Proportional-velocity VNA scan + precision park at the measured peak.
 
@@ -990,6 +975,10 @@ class GimbalController:
         def _vel(angle, hint):
             return _clamp(kv * abs(angle - hint), v_min, v_max)
 
+        def _scan_aborted():
+            k = ctypes.windll.user32.GetAsyncKeyState
+            return bool(k(0x51) & 0x8000) or bool(k(0x1B) & 0x8000)  # Q or ESC
+
         print(f"\nPhase 1: H sweep  hint={target_h:.2f}°  "
               f"vel = clamp({kv}×|H−{target_h:.1f}°|, {v_min}, {v_max}) dps")
 
@@ -1016,6 +1005,11 @@ class GimbalController:
         mbx.move_pos(mbx.H, h_goal_pos)
 
         while True:
+            if _scan_aborted():
+                print("\n*** Scan aborted (Q/ESC) ***")
+                mbx.set_velocity(0, 0, 0)
+                self.home()
+                return
             cur_h_pos = mbx.current_pos(mbx.H, 1)
             cur_h_ang = mbx.convertpostoangle(mbx.H, cur_h_pos)
             try:
@@ -1067,6 +1061,11 @@ class GimbalController:
         mbx.move_pos(mbx.V, v_goal_pos)
 
         while True:
+            if _scan_aborted():
+                print("\n*** Scan aborted (Q/ESC) ***")
+                mbx.set_velocity(0, 0, 0)
+                self.home()
+                return
             cur_v_pos = mbx.current_pos(mbx.V, 1)
             cur_v_ang = mbx.convertpostoangle(mbx.V, cur_v_pos)
             try:
@@ -1339,9 +1338,9 @@ class GimbalController:
     # ------------------------------------------------------------------------------------------------------------------
 
     def move_with_pid(self, h=None, v=None,
-                      kv=1.5, v_min=1.0, v_max=30.0,
+                      kv=1.6, v_min=1.0, v_max=14.6,
                       tolerance=0.1, max_time=30.0,
-                      poll_interval=0.05, plot=True):
+                      poll_interval=0.05, plot=True, verbose=True):
         """Move to (h, v) with velocity-proportional position correction, then fine-settle.
 
         Each poll tick the loop reads position, computes error, and sets motor velocity
@@ -1351,7 +1350,7 @@ class GimbalController:
         mbx.move_angle(accuracy="VERY HIGH") step eliminates residual backlash via the
         SDK's built-in overshoot-then-approach correction.
 
-        Prints a live position/error/velocity table and optionally plots on completion.
+        verbose=False suppresses per-tick table output (used by tune_velocity_controller).
         Returns the log dict.
         """
         self._require_connection()
@@ -1376,13 +1375,14 @@ class GimbalController:
         }
 
         SEP = "─" * 76
-        print(f"\n{SEP}")
-        print(f"  VELOCITY-CONTROLLED MOVE  →  H={h_target:.3f}°  V={v_target:.3f}°")
-        print(f"  Kv={kv} dps/°  range=[{v_min}, {v_max}] dps  tol=±{tolerance}°")
-        print(SEP)
-        print(f"{'t(s)':>7}  {'H actual':>10}  {'H error':>9}  {'vel_H':>7}"
-              f"  {'V actual':>10}  {'V error':>9}  {'vel_V':>7}")
-        print(SEP)
+        if verbose:
+            print(f"\n{SEP}")
+            print(f"  VELOCITY-CONTROLLED MOVE  →  H={h_target:.3f}°  V={v_target:.3f}°")
+            print(f"  Kv={kv} dps/°  range=[{v_min}, {v_max}] dps  tol=±{tolerance}°")
+            print(SEP)
+            print(f"{'t(s)':>7}  {'H actual':>10}  {'H error':>9}  {'vel_H':>7}"
+                  f"  {'V actual':>10}  {'V error':>9}  {'vel_V':>7}")
+            print(SEP)
 
         t0 = time.time()
         settled = 0
@@ -1403,10 +1403,11 @@ class GimbalController:
             log["h_error"].append(h_err)
             log["v_error"].append(v_err)
 
-            print(
-                f"{elapsed:7.2f}  {h_act:+10.3f}°  {h_err:+9.3f}°  {vel_h:7.2f}"
-                f"  {v_act:+10.3f}°  {v_err:+9.3f}°  {vel_v:7.2f}"
-            )
+            if verbose:
+                print(
+                    f"{elapsed:7.2f}  {h_act:+10.3f}°  {h_err:+9.3f}°  {vel_h:7.2f}"
+                    f"  {v_act:+10.3f}°  {v_err:+9.3f}°  {vel_v:7.2f}"
+                )
 
             if abs(h_err) <= tolerance and abs(v_err) <= tolerance:
                 settled += 1
@@ -1420,14 +1421,16 @@ class GimbalController:
                 mbx.move_pos(mbx.V, v_steps)
 
             if elapsed >= max_time:
-                print(f"\n  Timeout after {max_time}s. "
-                      f"Residual: H={h_err:+.3f}°  V={v_err:+.3f}°")
+                if verbose:
+                    print(f"\n  Timeout after {max_time}s. "
+                          f"Residual: H={h_err:+.3f}°  V={v_err:+.3f}°")
                 break
 
             time.sleep(poll_interval)
 
         # Fine-settle: SDK overshoot-then-approach backlash correction
-        print(f"\n  Fine-settle (VERY HIGH accuracy — overshoot + backlash correction)...")
+        if verbose:
+            print(f"\n  Fine-settle (VERY HIGH accuracy — overshoot + backlash correction)...")
         mbx.set_velocity(0, 0, 0)  # 0 → max velocity for the settle move
         mbx.move_angle(hang=h_target, vang=v_target, accuracy="VERY HIGH")
 
@@ -1442,10 +1445,13 @@ class GimbalController:
         log["h_error"].append(h_err)
         log["v_error"].append(v_err)
 
-        print(SEP)
-        print(f"  Final: H_err={h_err:+.4f}°  V_err={v_err:+.4f}°  t={elapsed:.2f}s")
-        self._print_position()
-        print(f"{SEP}\n")
+        if verbose:
+            print(SEP)
+            print(f"  Final: H_err={h_err:+.4f}°  V_err={v_err:+.4f}°  t={elapsed:.2f}s")
+            self._print_position()
+            print(f"{SEP}\n")
+        else:
+            print(f"    settle: H_err={h_err:+.4f}°  V_err={v_err:+.4f}°  t={elapsed:.2f}s")
 
         if plot:
             self._plot_pid_results(log)
@@ -1620,10 +1626,10 @@ if __name__ == "__main__":
         print("  5 - 2D sweep to find the VNA peak")
         print("  6 - Adaptive-speed sweep around a proposed best angle")
         print("  7 - Proportional-velocity VNA scan + precision park at measured peak")
-        choice = input("Enter 1, 2, 3, 4, 5, 6, or 7: ").strip()
+        choice = input("Enter 1-7: ").strip()
         if choice in ("1", "2", "3", "4", "5", "6", "7"):
             break
-        print("Invalid input -- enter 1, 2, 3, 4, 5, 6, or 7.")
+        print("Invalid input -- enter a number from 1 to 7.")
 
     def _attach_vna(gim):
         if SIMULATE_VNA:
