@@ -1341,7 +1341,7 @@ class GimbalController:
     def move_with_pid(self, h=None, v=None,
                       kv=1.5, v_min=1.0, v_max=30.0,
                       tolerance=0.1, max_time=30.0,
-                      poll_interval=0.05, plot=True):
+                      poll_interval=0.05, plot=True, verbose=True):
         """Move to (h, v) with velocity-proportional position correction, then fine-settle.
 
         Each poll tick the loop reads position, computes error, and sets motor velocity
@@ -1351,7 +1351,7 @@ class GimbalController:
         mbx.move_angle(accuracy="VERY HIGH") step eliminates residual backlash via the
         SDK's built-in overshoot-then-approach correction.
 
-        Prints a live position/error/velocity table and optionally plots on completion.
+        verbose=False suppresses per-tick table output (used by tune_velocity_controller).
         Returns the log dict.
         """
         self._require_connection()
@@ -1376,13 +1376,14 @@ class GimbalController:
         }
 
         SEP = "─" * 76
-        print(f"\n{SEP}")
-        print(f"  VELOCITY-CONTROLLED MOVE  →  H={h_target:.3f}°  V={v_target:.3f}°")
-        print(f"  Kv={kv} dps/°  range=[{v_min}, {v_max}] dps  tol=±{tolerance}°")
-        print(SEP)
-        print(f"{'t(s)':>7}  {'H actual':>10}  {'H error':>9}  {'vel_H':>7}"
-              f"  {'V actual':>10}  {'V error':>9}  {'vel_V':>7}")
-        print(SEP)
+        if verbose:
+            print(f"\n{SEP}")
+            print(f"  VELOCITY-CONTROLLED MOVE  →  H={h_target:.3f}°  V={v_target:.3f}°")
+            print(f"  Kv={kv} dps/°  range=[{v_min}, {v_max}] dps  tol=±{tolerance}°")
+            print(SEP)
+            print(f"{'t(s)':>7}  {'H actual':>10}  {'H error':>9}  {'vel_H':>7}"
+                  f"  {'V actual':>10}  {'V error':>9}  {'vel_V':>7}")
+            print(SEP)
 
         t0 = time.time()
         settled = 0
@@ -1403,10 +1404,11 @@ class GimbalController:
             log["h_error"].append(h_err)
             log["v_error"].append(v_err)
 
-            print(
-                f"{elapsed:7.2f}  {h_act:+10.3f}°  {h_err:+9.3f}°  {vel_h:7.2f}"
-                f"  {v_act:+10.3f}°  {v_err:+9.3f}°  {vel_v:7.2f}"
-            )
+            if verbose:
+                print(
+                    f"{elapsed:7.2f}  {h_act:+10.3f}°  {h_err:+9.3f}°  {vel_h:7.2f}"
+                    f"  {v_act:+10.3f}°  {v_err:+9.3f}°  {vel_v:7.2f}"
+                )
 
             if abs(h_err) <= tolerance and abs(v_err) <= tolerance:
                 settled += 1
@@ -1420,14 +1422,16 @@ class GimbalController:
                 mbx.move_pos(mbx.V, v_steps)
 
             if elapsed >= max_time:
-                print(f"\n  Timeout after {max_time}s. "
-                      f"Residual: H={h_err:+.3f}°  V={v_err:+.3f}°")
+                if verbose:
+                    print(f"\n  Timeout after {max_time}s. "
+                          f"Residual: H={h_err:+.3f}°  V={v_err:+.3f}°")
                 break
 
             time.sleep(poll_interval)
 
         # Fine-settle: SDK overshoot-then-approach backlash correction
-        print(f"\n  Fine-settle (VERY HIGH accuracy — overshoot + backlash correction)...")
+        if verbose:
+            print(f"\n  Fine-settle (VERY HIGH accuracy — overshoot + backlash correction)...")
         mbx.set_velocity(0, 0, 0)  # 0 → max velocity for the settle move
         mbx.move_angle(hang=h_target, vang=v_target, accuracy="VERY HIGH")
 
@@ -1442,15 +1446,169 @@ class GimbalController:
         log["h_error"].append(h_err)
         log["v_error"].append(v_err)
 
-        print(SEP)
-        print(f"  Final: H_err={h_err:+.4f}°  V_err={v_err:+.4f}°  t={elapsed:.2f}s")
-        self._print_position()
-        print(f"{SEP}\n")
+        if verbose:
+            print(SEP)
+            print(f"  Final: H_err={h_err:+.4f}°  V_err={v_err:+.4f}°  t={elapsed:.2f}s")
+            self._print_position()
+            print(f"{SEP}\n")
+        else:
+            print(f"    settle: H_err={h_err:+.4f}°  V_err={v_err:+.4f}°  t={elapsed:.2f}s")
 
         if plot:
             self._plot_pid_results(log)
 
         return log
+
+    # ------------------------------------------------------------------------------------------------------------------
+    #  VELOCITY CONTROLLER TUNER
+    # ------------------------------------------------------------------------------------------------------------------
+
+    def tune_velocity_controller(self,
+                                  start_h=40.0, start_v=20.0,
+                                  target_h=0.0, target_v=0.0,
+                                  max_trials=60):
+        """Auto-tune kv, v_min, v_max for move_with_pid by running real hardware moves.
+
+        Moves from (start_h, start_v) to (target_h, target_v) repeatedly with different
+        parameter candidates, measuring settling time and overshoot each trial.
+        Uses scipy Nelder-Mead if available; falls back to a two-pass grid search.
+
+        Each trial takes ~10-25 s on hardware; 60 trials ≈ 15-25 minutes total.
+        Prints the best-found values at the end — paste them into run_velocity_scan().
+
+        # ================================================================
+        # TUNER — comment out the call site in __main__ after use.
+        # ================================================================
+        """
+        self._require_connection()
+
+        trial_num = [0]
+        best_cost = [float("inf")]
+        best_params = [1.5, 1.0, 30.0]   # [kv, v_min, v_max] starting guess
+        TSEP = "=" * 62
+
+        def _overshoot(errors):
+            """Return the max magnitude of any error sample that crossed zero (overshoot)."""
+            if len(errors) < 2:
+                return 0.0
+            sign0 = 1 if errors[0] >= 0 else -1
+            return max(
+                (abs(e) for e in errors if (1 if e >= 0 else -1) != sign0),
+                default=0.0,
+            )
+
+        def _eval(kv, v_min, v_max):
+            kv    = max(0.2, min(10.0, float(kv)))
+            v_min = max(0.1, min(5.0,  float(v_min)))
+            v_max = max(v_min + 0.5, min(80.0, float(v_max)))
+
+            trial_num[0] += 1
+            print(f"\n[Trial {trial_num[0]:3d}/{max_trials}]  "
+                  f"kv={kv:.4f}  v_min={v_min:.4f}  v_max={v_max:.4f}")
+
+            mbx.move_angle(hang=start_h, vang=start_v, accuracy="HIGH")
+            time.sleep(0.2)
+
+            log = self.move_with_pid(
+                h=target_h, v=target_v,
+                kv=kv, v_min=v_min, v_max=v_max,
+                tolerance=0.1, max_time=30.0,
+                plot=False, verbose=False,
+            )
+
+            t_data  = log["t"]
+            h_err   = log["h_error"]
+            v_err   = log["v_error"]
+
+            settling_time = t_data[-1] if t_data else 30.0
+            h_over        = _overshoot(h_err)
+            v_over        = _overshoot(v_err)
+            final_err     = abs(h_err[-1]) + abs(v_err[-1]) if h_err else 99.0
+
+            # Cost: penalise slow settling, overshoot, and residual error
+            cost = settling_time + 5.0 * (h_over + v_over) + 20.0 * final_err
+            print(f"           cost={cost:.3f}  "
+                  f"(settle={settling_time:.2f}s  "
+                  f"over_H={h_over:.3f}°  over_V={v_over:.3f}°  "
+                  f"final_err={final_err:.4f}°)")
+
+            if cost < best_cost[0]:
+                best_cost[0]  = cost
+                best_params[:] = [kv, v_min, v_max]
+                print(f"           *** new best ***")
+
+            return cost
+
+        print(f"\n{TSEP}")
+        print("  VELOCITY CONTROLLER TUNER")
+        print(f"  Start  : H={start_h}°  V={start_v}°")
+        print(f"  Target : H={target_h}°  V={target_v}°")
+        print(f"  Max trials: {max_trials}  (~{max_trials * 18 // 60}-{max_trials * 25 // 60} min)")
+        print(TSEP)
+
+        try:
+            from scipy.optimize import minimize as _sp_minimize
+            print("scipy found — using Nelder-Mead optimiser.\n")
+
+            _sp_minimize(
+                lambda p: _eval(p[0], p[1], p[2]),
+                x0=[1.5, 1.0, 30.0],
+                method="Nelder-Mead",
+                options={
+                    "maxiter": max_trials,
+                    "xatol": 0.05,
+                    "fatol": 0.5,
+                    "adaptive": True,
+                },
+            )
+
+        except ImportError:
+            print("scipy not found — using two-pass grid search.\n")
+
+            # Coarse pass: 5×3×3 = 45 points
+            for kv in (0.5, 1.0, 1.5, 2.5, 4.0):
+                for vn in (0.5, 1.0, 2.0):
+                    for vx in (15.0, 30.0, 50.0):
+                        _eval(kv, vn, vx)
+                        if trial_num[0] >= max_trials:
+                            break
+                    if trial_num[0] >= max_trials:
+                        break
+                if trial_num[0] >= max_trials:
+                    break
+
+            # Fine pass: 3×3×3 = 27 points around the current best
+            if trial_num[0] < max_trials:
+                bkv, bvn, bvx = best_params
+                for kv in (bkv * 0.75, bkv, bkv * 1.25):
+                    for vn in (max(0.1, bvn * 0.75), bvn, bvn * 1.25):
+                        for vx in (bvx * 0.75, bvx, bvx * 1.25):
+                            _eval(kv, vn, vx)
+                            if trial_num[0] >= max_trials:
+                                break
+                        if trial_num[0] >= max_trials:
+                            break
+                    if trial_num[0] >= max_trials:
+                        break
+
+        kv_best, v_min_best, v_max_best = best_params
+
+        print(f"\n{TSEP}")
+        print("  TUNING COMPLETE")
+        print(f"  Trials run : {trial_num[0]}")
+        print(f"  Best cost  : {best_cost[0]:.3f}")
+        print(TSEP)
+        print()
+        print("  *** TUNED VELOCITY CONTROLLER PARAMETERS ***")
+        print(f"      kv     = {kv_best:.4f}    # dps per degree of error")
+        print(f"      v_min  = {v_min_best:.4f}    # minimum motor velocity (dps)")
+        print(f"      v_max  = {v_max_best:.4f}    # maximum motor velocity (dps)")
+        print()
+        print("  Paste these into run_velocity_scan() / move_with_pid() calls:")
+        print(f"      kv={kv_best:.4f}, v_min={v_min_best:.4f}, v_max={v_max_best:.4f}")
+        print(TSEP)
+
+        return kv_best, v_min_best, v_max_best
 
     @staticmethod
     def _plot_pid_results(log):
@@ -1608,6 +1766,15 @@ class GimbalController:
 
 
 if __name__ == "__main__":
+    # ==============================================================
+    # TUNER BLOCK — uncomment to run, comment back out afterwards.
+    # No VNA needed. Adjust start/target angles to match your setup.
+    # with GimbalController(port="COM3") as gim:
+    #     gim.tune_velocity_controller(start_h=40.0, start_v=20.0,
+    #                                   target_h=0.0,  target_v=0.0)
+    # import sys; sys.exit(0)
+    # ==============================================================
+
     vna_mode = "SIMULATED" if SIMULATE_VNA else f"REAL @ {VNA_ADDRESS}"
     while True:
         print("")
