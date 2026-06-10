@@ -825,6 +825,13 @@ class GimbalController:
             print("Invalid angle entered; using 0.0 degrees as the target center.")
             target_h = 0.0
 
+        try:
+            print("Enter the target V angle in degrees (used to shape V sweep velocity).")
+            target_v = float(input("Enter target V angle in degrees: ").strip())
+        except Exception:
+            print("Invalid angle entered; using 0.0 degrees as the V target.")
+            target_v = 0.0
+
         def _speed_for_angle(h_angle):
             delta = abs(h_angle - target_h)
             if delta <= SCAN_NEAR_RADIUS_DEG:
@@ -833,7 +840,15 @@ class GimbalController:
                 return SCAN_SPEED_MID_DPS * SCAN_SPEED_SCALE
             return SCAN_SPEED_FAR_DPS * SCAN_SPEED_SCALE
 
-        print("\nStarting continuous adaptive sweep around H=%.2f deg" % target_h)
+        def _speed_for_v(v_angle):
+            delta = abs(v_angle - target_v)
+            if delta <= SCAN_NEAR_RADIUS_DEG:
+                return SCAN_SPEED_NEAR_DPS * SCAN_SPEED_SCALE
+            if delta <= SCAN_FAST_RADIUS_DEG:
+                return SCAN_SPEED_MID_DPS * SCAN_SPEED_SCALE
+            return SCAN_SPEED_FAR_DPS * SCAN_SPEED_SCALE
+
+        print("\nStarting continuous adaptive sweep  H=%.2f deg  V=%.2f deg" % (target_h, target_v))
         print("  within %.1f deg -> %.1f dps" % (SCAN_NEAR_RADIUS_DEG, SCAN_SPEED_NEAR_DPS))
         print("  within %.1f deg -> %.1f dps" % (SCAN_FAST_RADIUS_DEG, SCAN_SPEED_MID_DPS))
         print("  beyond %.1f deg -> %.1f dps" % (SCAN_FAST_RADIUS_DEG, SCAN_SPEED_FAR_DPS))
@@ -893,7 +908,7 @@ class GimbalController:
         time.sleep(0.1)
 
         v_goal_pos = mbx.convertangletopos(mbx.V, 180.0)
-        mbx.set_velocity(0, _speed_for_angle(best_h), 0)
+        mbx.set_velocity(0, _speed_for_v(-180.0), 0)
         mbx.move_pos(mbx.V, v_goal_pos)
 
         done_tol_pos_v = abs(mbx.convertangletopos(mbx.V, 1.0) - mbx.convertangletopos(mbx.V, 0.0))
@@ -916,7 +931,7 @@ class GimbalController:
                 best_h = mbx.convertpostoangle(mbx.H, mbx.current_pos(mbx.H, 1))
                 best_v = cur_v_ang
 
-            vel_v = _speed_for_angle(best_h)
+            vel_v = _speed_for_v(cur_v_ang)
             if last_vel_v != vel_v:
                 mbx.set_velocity(0, vel_v, 0)
                 last_vel_v = vel_v
@@ -938,6 +953,168 @@ class GimbalController:
             print("Position error vs simulated center: dH=%+.2f deg, dV=%+.2f deg" % (err_h, err_v))
         print(f"Motion complete in {elapsed:.2f} seconds")
         print("Parked at the strongest measured VNA direction.")
+        self.run_keyboard_control(start_h=best_h, start_v=best_v)
+
+    def run_velocity_scan(self, kv=1.5, v_min=1.0, v_max=30.0,
+                          poll_interval=0.05, tolerance=0.1, plot=True):
+        """Proportional-velocity VNA scan + precision park at the measured peak.
+
+        Three phases:
+          1. H sweep  (-180° → +180°) with velocity = clamp(Kv × |H − target_h|, v_min, v_max).
+             Slower near the suggested target, faster far away.
+          2. V sweep  (-180° → +180°) at the best H found, same proportional profile vs target_v.
+          3. Precision park at the VNA peak using velocity-proportional approach then
+             VERY HIGH accuracy fine-settle (move_with_pid).
+
+        The target angles are user-supplied hints that shape the scan velocity — the VNA
+        determines the actual final pointing direction.
+        """
+        self._require_connection()
+        if self._vna is None:
+            raise RuntimeError("VNA not connected — call connect_vna() first")
+
+        t0 = time.time()
+
+        try:
+            target_h = float(input("Suggested H angle — scan slows near here (degrees): ").strip())
+        except Exception:
+            print("Invalid; using 0.0°.")
+            target_h = 0.0
+
+        try:
+            target_v = float(input("Suggested V angle — scan slows near here (degrees): ").strip())
+        except Exception:
+            print("Invalid; using 0.0°.")
+            target_v = 0.0
+
+        def _vel(angle, hint):
+            return _clamp(kv * abs(angle - hint), v_min, v_max)
+
+        print(f"\nPhase 1: H sweep  hint={target_h:.2f}°  "
+              f"vel = clamp({kv}×|H−{target_h:.1f}°|, {v_min}, {v_max}) dps")
+
+        try:
+            self._vna.fix_status()
+        except Exception:
+            pass
+
+        mbx.move_angle(vang=0.0, hang=-180.0, accuracy="HIGH")
+        time.sleep(0.1)
+
+        best_h = -180.0
+        best_v = 0.0
+        best_db = float("-inf")
+        h_scan_ang = []
+        h_scan_db = []
+
+        done_tol_h = abs(mbx.convertangletopos(mbx.H, 1.0) - mbx.convertangletopos(mbx.H, 0.0))
+        if done_tol_h < 1:
+            done_tol_h = 1
+
+        h_goal_pos = mbx.convertangletopos(mbx.H, 180.0)
+        mbx.set_velocity(_vel(-180.0, target_h), 0, 0)
+        mbx.move_pos(mbx.H, h_goal_pos)
+
+        last_vel_h = None
+        while True:
+            cur_h_pos = mbx.current_pos(mbx.H, 1)
+            cur_h_ang = mbx.convertpostoangle(mbx.H, cur_h_pos)
+            try:
+                db_vals = self.measure().get("db", [])
+                peak = max(db_vals) if db_vals else float("-inf")
+            except Exception:
+                peak = float("-inf")
+
+            if peak > best_db:
+                best_db = peak
+                best_h = cur_h_ang
+                best_v = mbx.convertpostoangle(mbx.V, mbx.current_pos(mbx.V, 1))
+
+            h_scan_ang.append(cur_h_ang)
+            h_scan_db.append(peak)
+
+            vel_h = _vel(cur_h_ang, target_h)
+            if vel_h != last_vel_h:
+                mbx.set_velocity(vel_h, 0, 0)
+                last_vel_h = vel_h
+
+            print(f"  H={cur_h_ang:+8.3f}°  vel={vel_h:5.2f} dps  P={peak:.2f} dB"
+                  f"  (best H={best_h:.2f}° @ {best_db:.2f} dB)")
+
+            if abs(h_goal_pos - cur_h_pos) <= done_tol_h:
+                break
+            time.sleep(poll_interval)
+
+        mbx.set_velocity(0, 0, 0)
+
+        # ---- Phase 2: V sweep at best H ----
+        print(f"\nPhase 2: V sweep at H={best_h:.2f}°  hint={target_v:.2f}°  "
+              f"vel = clamp({kv}×|V−{target_v:.1f}°|, {v_min}, {v_max}) dps")
+
+        mbx.move_angle(hang=best_h, vang=-180.0, accuracy="HIGH")
+        time.sleep(0.1)
+
+        v_scan_ang = []
+        v_scan_db = []
+
+        done_tol_v = abs(mbx.convertangletopos(mbx.V, 1.0) - mbx.convertangletopos(mbx.V, 0.0))
+        if done_tol_v < 1:
+            done_tol_v = 1
+
+        v_goal_pos = mbx.convertangletopos(mbx.V, 180.0)
+        mbx.set_velocity(0, _vel(-180.0, target_v), 0)
+        mbx.move_pos(mbx.V, v_goal_pos)
+
+        last_vel_v = None
+        while True:
+            cur_v_pos = mbx.current_pos(mbx.V, 1)
+            cur_v_ang = mbx.convertpostoangle(mbx.V, cur_v_pos)
+            try:
+                db_vals = self.measure().get("db", [])
+                peak = max(db_vals) if db_vals else float("-inf")
+            except Exception:
+                peak = float("-inf")
+
+            if peak > best_db:
+                best_db = peak
+                best_h = mbx.convertpostoangle(mbx.H, mbx.current_pos(mbx.H, 1))
+                best_v = cur_v_ang
+
+            v_scan_ang.append(cur_v_ang)
+            v_scan_db.append(peak)
+
+            vel_v = _vel(cur_v_ang, target_v)
+            if vel_v != last_vel_v:
+                mbx.set_velocity(0, vel_v, 0)
+                last_vel_v = vel_v
+
+            print(f"  V={cur_v_ang:+8.3f}°  vel={vel_v:5.2f} dps  P={peak:.2f} dB"
+                  f"  (best V={best_v:.2f}° @ {best_db:.2f} dB)")
+
+            if abs(v_goal_pos - cur_v_pos) <= done_tol_v:
+                break
+            time.sleep(poll_interval)
+
+        mbx.set_velocity(0, 0, 0)
+
+        print(f"\nScan complete. VNA peak: H={best_h:.3f}°  V={best_v:.3f}°  P={best_db:.2f} dB")
+        if self._simulated_vna:
+            print(f"Simulated beam center H=0.00° V=0.00°  →  "
+                  f"dH={best_h:+.3f}°  dV={best_v:+.3f}°")
+
+        # ---- Phase 3: precision park ----
+        print(f"\nPhase 3: velocity-controlled park at VNA peak + VERY HIGH accuracy fine-settle...")
+        park_log = self.move_with_pid(h=best_h, v=best_v, kv=kv,
+                                       v_min=v_min, v_max=v_max,
+                                       tolerance=tolerance, plot=False)
+
+        print(f"\nTotal elapsed: {time.time() - t0:.2f}s")
+
+        if plot:
+            self._plot_scan_results(h_scan_ang, h_scan_db, v_scan_ang, v_scan_db,
+                                     best_h, best_v, park_log)
+
+        print("\nParked at VNA peak. Entering keyboard control — Q/ESC to quit & home.")
         self.run_keyboard_control(start_h=best_h, start_v=best_v)
 
     def run_continuous_sweep(self, minh=-180.0, maxh=180.0, step=1.0,
@@ -1333,6 +1510,65 @@ class GimbalController:
         plt.tight_layout()
         plt.show()
 
+    @staticmethod
+    def _plot_scan_results(h_ang, h_db, v_ang, v_db, best_h, best_v, park_log):
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+        fig.suptitle(
+            f"Velocity Scan + Park  →  VNA Peak: H={best_h:.3f}°  V={best_v:.3f}°",
+            fontsize=13, fontweight="bold",
+        )
+
+        ax = axes[0, 0]
+        ax.plot(h_ang, h_db, "b-", linewidth=1.2)
+        ax.axvline(best_h, color="r", linestyle="--", linewidth=1,
+                   label=f"Peak H={best_h:.2f}°")
+        ax.set_xlabel("H angle (°)")
+        ax.set_ylabel("VNA power (dB)")
+        ax.set_title("H Sweep — VNA Power")
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.4)
+
+        ax = axes[0, 1]
+        ax.plot(v_ang, v_db, "g-", linewidth=1.2)
+        ax.axvline(best_v, color="r", linestyle="--", linewidth=1,
+                   label=f"Peak V={best_v:.2f}°")
+        ax.set_xlabel("V angle (°)")
+        ax.set_ylabel("VNA power (dB)")
+        ax.set_title("V Sweep — VNA Power")
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.4)
+
+        t = park_log["t"]
+        ax = axes[1, 0]
+        ax.plot(t, park_log["h_actual"], "b-", linewidth=1.5, label="H actual")
+        ax.axhline(park_log["h_target"], color="b", linestyle="--", linewidth=1,
+                   label="H target")
+        ax.plot(t, park_log["v_actual"], "g-", linewidth=1.5, label="V actual")
+        ax.axhline(park_log["v_target"], color="g", linestyle="--", linewidth=1,
+                   label="V target")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Angle (°)")
+        ax.set_title("Park Phase — Position vs Time")
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.4)
+
+        ax = axes[1, 1]
+        ax.plot(t, park_log["h_error"], "b-", linewidth=1.5, label="H error")
+        ax.plot(t, park_log["v_error"], "g-", linewidth=1.5, label="V error")
+        ax.fill_between(t, park_log["h_error"], alpha=0.1, color="b")
+        ax.fill_between(t, park_log["v_error"], alpha=0.1, color="g")
+        ax.axhline(0, color="k", linewidth=0.5)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Error (°)")
+        ax.set_title("Park Phase — Position Error vs Time")
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.4)
+
+        plt.tight_layout()
+        plt.show()
+
     def close(self):
         if self._connected:
             try:
@@ -1384,7 +1620,7 @@ if __name__ == "__main__":
         print("  4 - Autonomous closed-loop DIRECT-MOTION alignment")
         print("  5 - 2D sweep to find the VNA peak")
         print("  6 - Adaptive-speed sweep around a proposed best angle")
-        print("  7 - PID-controlled move to a target angle (position + error plot)")
+        print("  7 - Proportional-velocity VNA scan + precision park at measured peak")
         choice = input("Enter 1, 2, 3, 4, 5, 6, or 7: ").strip()
         if choice in ("1", "2", "3", "4", "5", "6", "7"):
             break
@@ -1413,12 +1649,7 @@ if __name__ == "__main__":
             _attach_vna(gim)
             gim.run_adaptive_scan()
         elif choice == "7":
-            try:
-                h_in = float(input("Target H angle (degrees): ").strip())
-                v_in = float(input("Target V angle (degrees): ").strip())
-            except ValueError:
-                print("Invalid input, defaulting to (0, 0).")
-                h_in, v_in = 0.0, 0.0
-            gim.move_with_pid(h=h_in, v=v_in)
+            _attach_vna(gim)
+            gim.run_velocity_scan()
         else:
             gim.run_keyboard_control()
