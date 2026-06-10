@@ -1162,20 +1162,22 @@ class GimbalController:
     #  PID-CONTROLLED MOVE
     # ------------------------------------------------------------------------------------------------------------------
 
-    def move_with_pid(self, h=None, v=None, poll_interval=0.05, plot=True):
-        """Move to (h, v) using the SDK's built-in hardware PID + VERY HIGH accuracy mode.
+    def move_with_pid(self, h=None, v=None,
+                      kv=1.5, v_min=1.0, v_max=30.0,
+                      tolerance=0.1, max_time=30.0,
+                      poll_interval=0.05, plot=True):
+        """Move to (h, v) with velocity-proportional position correction, then fine-settle.
 
-        The Dynamixel motors run their own closed-loop position PID continuously during
-        movement (H: P=3000 I=3000 D=0; V: P=1000 I=3000 D=0).  VERY HIGH accuracy adds
-        a two-step backlash correction: the motor overshoots the target by 2° then approaches
-        from the same direction, settling within the hardware position threshold.
+        Each poll tick the loop reads position, computes error, and sets motor velocity
+        proportional to that error: vel = clamp(Kv * |error|, v_min, v_max) dps.
+        Large errors produce fast motion; small errors slow to a creep. Once both axes
+        sit within *tolerance* degrees the velocity loop exits and a final blocking
+        mbx.move_angle(accuracy="VERY HIGH") step eliminates residual backlash via the
+        SDK's built-in overshoot-then-approach correction.
 
-        This method runs the blocking mbx.move_angle call in a background thread so the
-        main thread can stream position and error to the terminal at *poll_interval* seconds.
-        On completion a 4-panel matplotlib figure is shown.  Returns the log dict.
+        Prints a live position/error/velocity table and optionally plots on completion.
+        Returns the log dict.
         """
-        import threading
-
         self._require_connection()
         if h is None and v is None:
             raise ValueError("At least one of h or v must be provided")
@@ -1188,40 +1190,36 @@ class GimbalController:
         h_target = float(h) if h is not None else pos["H"]
         v_target = float(v) if v is not None else pos["V"]
 
+        h_steps = mbx.convertangletopos(mbx.H, h_target)
+        v_steps = mbx.convertangletopos(mbx.V, v_target)
+
         log = {
             "t": [], "h_actual": [], "v_actual": [],
             "h_error": [], "v_error": [],
             "h_target": h_target, "v_target": v_target,
         }
 
-        SEP = "─" * 72
+        SEP = "─" * 76
         print(f"\n{SEP}")
-        print(f"  MOVE (VERY HIGH accuracy)  →  H={h_target:.3f}°  V={v_target:.3f}°")
-        print(f"  Hardware PID active  |  overshoot-then-approach backlash correction")
+        print(f"  VELOCITY-CONTROLLED MOVE  →  H={h_target:.3f}°  V={v_target:.3f}°")
+        print(f"  Kv={kv} dps/°  range=[{v_min}, {v_max}] dps  tol=±{tolerance}°")
         print(SEP)
-        print(f"{'t(s)':>7}  {'H actual':>10}  {'H error':>9}  {'V actual':>10}  {'V error':>9}")
+        print(f"{'t(s)':>7}  {'H actual':>10}  {'H error':>9}  {'vel_H':>7}"
+              f"  {'V actual':>10}  {'V error':>9}  {'vel_V':>7}")
         print(SEP)
-
-        done = threading.Event()
-        move_exc = [None]
-
-        def _do_move():
-            try:
-                mbx.move_angle(hang=h_target, vang=v_target, accuracy="VERY HIGH")
-            except Exception as exc:
-                move_exc[0] = exc
-            finally:
-                done.set()
-
-        threading.Thread(target=_do_move, daemon=True).start()
 
         t0 = time.time()
-        while not done.is_set():
+        settled = 0
+
+        while True:
             elapsed = time.time() - t0
             h_act = mbx.convertpostoangle(mbx.H, mbx.current_pos(mbx.H, 1))
             v_act = mbx.convertpostoangle(mbx.V, mbx.current_pos(mbx.V, 1))
             h_err = h_target - h_act
             v_err = v_target - v_act
+
+            vel_h = _clamp(kv * abs(h_err), v_min, v_max)
+            vel_v = _clamp(kv * abs(v_err), v_min, v_max)
 
             log["t"].append(elapsed)
             log["h_actual"].append(h_act)
@@ -1230,15 +1228,33 @@ class GimbalController:
             log["v_error"].append(v_err)
 
             print(
-                f"{elapsed:7.2f}  {h_act:+10.3f}°  {h_err:+9.3f}°"
-                f"  {v_act:+10.3f}°  {v_err:+9.3f}°"
+                f"{elapsed:7.2f}  {h_act:+10.3f}°  {h_err:+9.3f}°  {vel_h:7.2f}"
+                f"  {v_act:+10.3f}°  {v_err:+9.3f}°  {vel_v:7.2f}"
             )
+
+            if abs(h_err) <= tolerance and abs(v_err) <= tolerance:
+                settled += 1
+                if settled >= 3:
+                    break
+            else:
+                settled = 0
+                # Velocity proportional to error; re-issue position target at new speed
+                mbx.set_velocity(vel_h, vel_v, 0)
+                mbx.move_pos(mbx.H, h_steps)
+                mbx.move_pos(mbx.V, v_steps)
+
+            if elapsed >= max_time:
+                print(f"\n  Timeout after {max_time}s. "
+                      f"Residual: H={h_err:+.3f}°  V={v_err:+.3f}°")
+                break
+
             time.sleep(poll_interval)
 
-        if move_exc[0] is not None:
-            raise move_exc[0]
+        # Fine-settle: SDK overshoot-then-approach backlash correction
+        print(f"\n  Fine-settle (VERY HIGH accuracy — overshoot + backlash correction)...")
+        mbx.set_velocity(0, 0, 0)  # 0 → max velocity for the settle move
+        mbx.move_angle(hang=h_target, vang=v_target, accuracy="VERY HIGH")
 
-        # Capture final settled position
         elapsed = time.time() - t0
         h_act = mbx.convertpostoangle(mbx.H, mbx.current_pos(mbx.H, 1))
         v_act = mbx.convertpostoangle(mbx.V, mbx.current_pos(mbx.V, 1))
@@ -1251,7 +1267,7 @@ class GimbalController:
         log["v_error"].append(v_err)
 
         print(SEP)
-        print(f"  Settled: H_err={h_err:+.4f}°  V_err={v_err:+.4f}°  t={elapsed:.2f}s")
+        print(f"  Final: H_err={h_err:+.4f}°  V_err={v_err:+.4f}°  t={elapsed:.2f}s")
         self._print_position()
         print(f"{SEP}\n")
 
