@@ -1,3 +1,18 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+# gimbal_autoalign.py  -- SINGLE-FILE runnable script.
+#
+# GIM04 gimbal control + closed-loop, direct-motion beam alignment using VNA feedback.
+# The traditional step/grid scan is still available (mode 3); mode 4 is the closed-loop
+# direct-motion alignment (no full sweep, <= 5 correction passes).
+#
+# This script imports the stock MilliBox modules (mbx_functions, mbx_instrument) that are
+# already installed on the system; everything else (the alignment algorithm and the
+# controller) lives in THIS file, so only this one file needs to be run.
+#
+# Run:  python gimbal_autoalign.py mn
+
 import sys
 import atexit
 import ctypes
@@ -1000,7 +1015,6 @@ class GimbalController:
         mbx.set_velocity(_vel(-270.0, target_h), 0, 0)
         mbx.move_pos(mbx.H, h_goal_pos)
 
-        last_vel_h = None
         while True:
             cur_h_pos = mbx.current_pos(mbx.H, 1)
             cur_h_ang = mbx.convertpostoangle(mbx.H, cur_h_pos)
@@ -1018,10 +1032,12 @@ class GimbalController:
             h_scan_ang.append(cur_h_ang)
             h_scan_db.append(peak)
 
+            # Read encoder position every tick and re-issue move_pos so the Dynamixel
+            # applies the updated velocity profile immediately rather than keeping the
+            # profile set at the start of the sweep.
             vel_h = _vel(cur_h_ang, target_h)
-            if vel_h != last_vel_h:
-                mbx.set_velocity(vel_h, 0, 0)
-                last_vel_h = vel_h
+            mbx.set_velocity(vel_h, 0, 0)
+            mbx.move_pos(mbx.H, h_goal_pos)
 
             print(f"  H={cur_h_ang:+8.3f}°  vel={vel_h:5.2f} dps  P={peak:.2f} dB"
                   f"  (best H={best_h:.2f}° @ {best_db:.2f} dB)")
@@ -1050,7 +1066,6 @@ class GimbalController:
         mbx.set_velocity(0, _vel(-180.0, target_v), 0)
         mbx.move_pos(mbx.V, v_goal_pos)
 
-        last_vel_v = None
         while True:
             cur_v_pos = mbx.current_pos(mbx.V, 1)
             cur_v_ang = mbx.convertpostoangle(mbx.V, cur_v_pos)
@@ -1069,9 +1084,8 @@ class GimbalController:
             v_scan_db.append(peak)
 
             vel_v = _vel(cur_v_ang, target_v)
-            if vel_v != last_vel_v:
-                mbx.set_velocity(0, vel_v, 0)
-                last_vel_v = vel_v
+            mbx.set_velocity(0, vel_v, 0)
+            mbx.move_pos(mbx.V, v_goal_pos)
 
             print(f"  V={cur_v_ang:+8.3f}°  vel={vel_v:5.2f} dps  P={peak:.2f} dB"
                   f"  (best V={best_v:.2f}° @ {best_db:.2f} dB)")
