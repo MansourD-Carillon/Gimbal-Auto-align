@@ -34,7 +34,7 @@ _ANGLE_MAX = 180.0
 # Adaptive sweep speed settings (easy to tune at the top of the file)
 SCAN_SPEED_NEAR_DPS = 1.0      # slow speed near the target angle
 SCAN_SPEED_MID_DPS = 7.0      # faster speed away from the target center
-SCAN_SPEED_FAR_DPS = 30.0      # even faster speed farther away
+SCAN_SPEED_FAR_DPS = 14.7     # even faster speed farther away
 SCAN_SPEED_SCALE = 1.0         # global aggressiveness multiplier for all sweep speeds
 SCAN_NEAR_RADIUS_DEG = 5.0     # use slow speed within this many degrees of target
 SCAN_FAST_RADIUS_DEG = 10.0     # use medium speed up to this many degrees
@@ -46,7 +46,7 @@ SCAN_FAST_RADIUS_DEG = 10.0     # use medium speed up to this many degrees
 #                             gimbal's live (H,V) angles: a beam peaked at boresight (0,0). The COM gimbal is
 #                             still real and really moves, so this is a full end-to-end test of the alignment.
 #   SIMULATE_VNA = False  ->  connect to a real VNA over the ethernet (raw TCPIP SOCKET) at VNA_ADDRESS.
-SIMULATE_VNA = False
+SIMULATE_VNA = True
 VNA_ADDRESS  = "TCPIP0::192.168.6.150::9001::SOCKET"     # real VNA, used only when SIMULATE_VNA = False
 
 # Convenience aliases for the motor / gimbal-type constants (these never change at runtime)
@@ -510,36 +510,6 @@ def beam_align_directmotion(inst, **kwargs):
     else:
         print("*** ERROR: unknown gimbal type")
         return None, None
-
-
-# ######################################################################################################################
-# #  SOFTWARE PID CONTROLLER
-# ######################################################################################################################
-
-class PIDController:
-    """Discrete-time PID with anti-windup for one axis."""
-
-    def __init__(self, kp=1.5, ki=0.05, kd=0.3, max_integral=5.0):
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-        self.max_integral = max_integral
-        self._integral = 0.0
-        self._prev_error = 0.0
-
-    def reset(self):
-        self._integral = 0.0
-        self._prev_error = 0.0
-
-    def compute(self, error, dt):
-        dt = max(dt, 1e-3)
-        self._integral = _clamp(
-            self._integral + error * dt,
-            -self.max_integral, self.max_integral,
-        )
-        derivative = (error - self._prev_error) / dt
-        self._prev_error = error
-        return self.kp * error + self.ki * self._integral + self.kd * derivative
 
 
 # ######################################################################################################################
@@ -1192,20 +1162,20 @@ class GimbalController:
     #  PID-CONTROLLED MOVE
     # ------------------------------------------------------------------------------------------------------------------
 
-    def move_with_pid(self, h=None, v=None,
-                      kp=1.5, ki=0.05, kd=0.3,
-                      tolerance=0.1, max_time=30.0,
-                      poll_interval=0.05, plot=True):
-        """Move to (h, v) with a software PID outer loop that continuously corrects residual
-        position error throughout the move.
+    def move_with_pid(self, h=None, v=None, poll_interval=0.05, plot=True):
+        """Move to (h, v) using the SDK's built-in hardware PID + VERY HIGH accuracy mode.
 
-        The motor's internal firmware servo loop handles fast dynamics; this outer PID issues
-        corrective setpoint updates every *poll_interval* seconds to cancel steady-state error
-        caused by backlash, friction, or step quantisation.
+        The Dynamixel motors run their own closed-loop position PID continuously during
+        movement (H: P=3000 I=3000 D=0; V: P=1000 I=3000 D=0).  VERY HIGH accuracy adds
+        a two-step backlash correction: the motor overshoots the target by 2° then approaches
+        from the same direction, settling within the hardware position threshold.
 
-        Prints a live table to the terminal and, on completion, optionally renders a 4-panel
-        matplotlib plot (actual vs target position + error, both axes).  Returns the log dict.
+        This method runs the blocking mbx.move_angle call in a background thread so the
+        main thread can stream position and error to the terminal at *poll_interval* seconds.
+        On completion a 4-panel matplotlib figure is shown.  Returns the log dict.
         """
+        import threading
+
         self._require_connection()
         if h is None and v is None:
             raise ValueError("At least one of h or v must be provided")
@@ -1218,9 +1188,6 @@ class GimbalController:
         h_target = float(h) if h is not None else pos["H"]
         v_target = float(v) if v is not None else pos["V"]
 
-        pid_h = PIDController(kp, ki, kd)
-        pid_v = PIDController(kp, ki, kd)
-
         log = {
             "t": [], "h_actual": [], "v_actual": [],
             "h_error": [], "v_error": [],
@@ -1229,29 +1196,28 @@ class GimbalController:
 
         SEP = "─" * 72
         print(f"\n{SEP}")
-        print(f"  PID MOVE  →  H={h_target:.3f}°  V={v_target:.3f}°")
-        print(f"  Kp={kp}  Ki={ki}  Kd={kd}  tol=±{tolerance}°  poll={poll_interval}s")
+        print(f"  MOVE (VERY HIGH accuracy)  →  H={h_target:.3f}°  V={v_target:.3f}°")
+        print(f"  Hardware PID active  |  overshoot-then-approach backlash correction")
         print(SEP)
         print(f"{'t(s)':>7}  {'H actual':>10}  {'H error':>9}  {'V actual':>10}  {'V error':>9}")
         print(SEP)
 
-        # Kick off a non-blocking move toward the target
-        mbx.set_velocity(0, 0, 0)  # 0 → maximum velocity
-        h_steps = mbx.convertangletopos(mbx.H, h_target)
-        v_steps = mbx.convertangletopos(mbx.V, v_target)
-        mbx.move_pos(mbx.H, h_steps)
-        mbx.move_pos(mbx.V, v_steps)
+        done = threading.Event()
+        move_exc = [None]
+
+        def _do_move():
+            try:
+                mbx.move_angle(hang=h_target, vang=v_target, accuracy="VERY HIGH")
+            except Exception as exc:
+                move_exc[0] = exc
+            finally:
+                done.set()
+
+        threading.Thread(target=_do_move, daemon=True).start()
 
         t0 = time.time()
-        prev_t = t0
-        settled = 0
-
-        while True:
-            now = time.time()
-            elapsed = now - t0
-            dt = now - prev_t
-            prev_t = now
-
+        while not done.is_set():
+            elapsed = time.time() - t0
             h_act = mbx.convertpostoangle(mbx.H, mbx.current_pos(mbx.H, 1))
             v_act = mbx.convertpostoangle(mbx.V, mbx.current_pos(mbx.V, 1))
             h_err = h_target - h_act
@@ -1267,33 +1233,25 @@ class GimbalController:
                 f"{elapsed:7.2f}  {h_act:+10.3f}°  {h_err:+9.3f}°"
                 f"  {v_act:+10.3f}°  {v_err:+9.3f}°"
             )
-
-            within_tol = abs(h_err) <= tolerance and abs(v_err) <= tolerance
-            if within_tol:
-                settled += 1
-                if settled >= 5:
-                    print(f"\n  Converged: H_err={h_err:+.4f}°  V_err={v_err:+.4f}°"
-                          f"  t={elapsed:.2f}s")
-                    break
-            else:
-                settled = 0
-                # PID correction: nudge the commanded setpoint toward target
-                h_lo, h_hi = _angle_limits(H)
-                v_lo, v_hi = _angle_limits(V)
-                h_cmd = _clamp(h_target + pid_h.compute(h_err, dt), h_lo, h_hi)
-                v_cmd = _clamp(v_target + pid_v.compute(v_err, dt), v_lo, v_hi)
-                mbx.move_pos(mbx.H, mbx.convertangletopos(mbx.H, h_cmd))
-                mbx.move_pos(mbx.V, mbx.convertangletopos(mbx.V, v_cmd))
-
-            if elapsed >= max_time:
-                print(f"\n  Timeout after {max_time}s. "
-                      f"Residual: H={h_err:+.3f}°  V={v_err:+.3f}°")
-                break
-
             time.sleep(poll_interval)
 
-        # Final high-accuracy blocking settle to leave motor firmly on target
-        mbx.move_angle(hang=h_target, vang=v_target, accuracy="HIGH")
+        if move_exc[0] is not None:
+            raise move_exc[0]
+
+        # Capture final settled position
+        elapsed = time.time() - t0
+        h_act = mbx.convertpostoangle(mbx.H, mbx.current_pos(mbx.H, 1))
+        v_act = mbx.convertpostoangle(mbx.V, mbx.current_pos(mbx.V, 1))
+        h_err = h_target - h_act
+        v_err = v_target - v_act
+        log["t"].append(elapsed)
+        log["h_actual"].append(h_act)
+        log["v_actual"].append(v_act)
+        log["h_error"].append(h_err)
+        log["v_error"].append(v_err)
+
+        print(SEP)
+        print(f"  Settled: H_err={h_err:+.4f}°  V_err={v_err:+.4f}°  t={elapsed:.2f}s")
         self._print_position()
         print(f"{SEP}\n")
 
