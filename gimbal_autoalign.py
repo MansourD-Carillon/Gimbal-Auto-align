@@ -1077,6 +1077,96 @@ class GimbalController:
         finally:
             csvplot.close()
 
+    def run_pid_continuous(self, kp=2.0, ki=0.02, kd=0.3,
+                           probe_deg=2.0, max_correction=5.0):
+        """PID gradient tracker: continuously steer toward the VNA power peak and print each measurement.
+
+        Treats the estimated power gradient (dP/dAngle) as the PID error signal.
+        At the beam peak the gradient is zero; the controller drives toward zero gradient.
+        Q/ESC to stop.
+        """
+        self._require_connection()
+        if self._vna is None:
+            raise RuntimeError("VNA not connected — call connect_vna() first")
+
+        _k = ctypes.windll.user32.GetAsyncKeyState
+        def held(vk): return bool(_k(vk) & 0x8000)
+
+        lo_h, hi_h = _angle_limits(H)
+        lo_v, hi_v = _angle_limits(V)
+        h = _clamp(_read_angle(H), lo_h, hi_h)
+        v = _clamp(_read_angle(V), lo_v, hi_v)
+
+        int_h = int_v = 0.0
+        prev_grad_h = prev_grad_v = 0.0
+        t_prev = time.time()
+
+        print("\nPID continuous measurement tracking  (Q/ESC to quit & home)")
+        print(f"  Kp={kp}  Ki={ki}  Kd={kd}  probe={probe_deg} deg  max_corr={max_correction} deg")
+        print(f"\n{'Iter':>5}  {'H deg':>9}  {'V deg':>9}  {'P dB':>9}  "
+              f"{'grad_H':>9}  {'grad_V':>9}  {'corr_H':>8}  {'corr_V':>8}")
+        print("-" * 85)
+
+        iteration = 0
+        while True:
+            if held(0x51) or held(0x1B):   # Q or ESC
+                break
+
+            iteration += 1
+            t_now = time.time()
+            dt = max(t_now - t_prev, 1e-3)
+            t_prev = t_now
+
+            # Center measurement
+            mbx.move_angle(hang=h, vang=v, accuracy="HIGH")
+            p0 = self._align_measure()
+
+            # H gradient — probe +/- probe_deg around current H
+            h_p = _clamp(h + probe_deg, lo_h, hi_h)
+            h_m = _clamp(h - probe_deg, lo_h, hi_h)
+            mbx.move_angle(hang=h_p, vang=v, accuracy="HIGH")
+            p_hp = self._align_measure()
+            mbx.move_angle(hang=h_m, vang=v, accuracy="HIGH")
+            p_hm = self._align_measure()
+
+            # V gradient — probe +/- probe_deg around current V
+            v_p = _clamp(v + probe_deg, lo_v, hi_v)
+            v_m = _clamp(v - probe_deg, lo_v, hi_v)
+            mbx.move_angle(hang=h, vang=v_p, accuracy="HIGH")
+            p_vp = self._align_measure()
+            mbx.move_angle(hang=h, vang=v_m, accuracy="HIGH")
+            p_vm = self._align_measure()
+
+            # Gradient estimates (dB/deg)
+            g_h = ((p_hp - p_hm) / (2.0 * probe_deg)
+                   if p_hp is not None and p_hm is not None else 0.0)
+            g_v = ((p_vp - p_vm) / (2.0 * probe_deg)
+                   if p_vp is not None and p_vm is not None else 0.0)
+
+            # PID update  (gradient is the error; target = 0 at the peak)
+            int_h = _clamp(int_h + g_h * dt, -30.0, 30.0)   # anti-windup clamp
+            int_v = _clamp(int_v + g_v * dt, -30.0, 30.0)
+            deriv_h = (g_h - prev_grad_h) / dt
+            deriv_v = (g_v - prev_grad_v) / dt
+
+            corr_h = _clamp(kp * g_h + ki * int_h + kd * deriv_h,
+                            -max_correction, max_correction)
+            corr_v = _clamp(kp * g_v + ki * int_v + kd * deriv_v,
+                            -max_correction, max_correction)
+
+            h = _clamp(h + corr_h, lo_h, hi_h)
+            v = _clamp(v + corr_v, lo_v, hi_v)
+            mbx.move_angle(hang=h, vang=v, accuracy="HIGH")
+
+            prev_grad_h = g_h
+            prev_grad_v = g_v
+
+            print(f"{iteration:5d}  {h:+9.3f}  {v:+9.3f}  {_fmt(p0):>9}  "
+                  f"{g_h:+9.4f}  {g_v:+9.4f}  {corr_h:+8.3f}  {corr_v:+8.3f}")
+
+        print("\nPID tracking stopped.")
+        self.home()
+
     def run_keyboard_control(self, start_h=0.0, start_v=0.0):
         self._require_connection()
 
@@ -1208,7 +1298,7 @@ if __name__ == "__main__":
         print("  3 - Autonomous VNA grid scan")
         print("  4 - Autonomous closed-loop DIRECT-MOTION alignment")
         print("  5 - 2D sweep to find the VNA peak")
-        print("  6 - Adaptive-speed sweep around a proposed best angle")
+        print("  6 - PID continuous measurement tracking (live print, Q/ESC to stop)")
         choice = input("Enter 1, 2, 3, 4, 5, or 6: ").strip()
         if choice in ("1", "2", "3", "4", "5", "6"):
             break
@@ -1235,6 +1325,6 @@ if __name__ == "__main__":
             gim.run_scan()
         elif choice == "6":
             _attach_vna(gim)
-            gim.run_adaptive_scan()
+            gim.run_pid_continuous()
         else:
             gim.run_keyboard_control()
