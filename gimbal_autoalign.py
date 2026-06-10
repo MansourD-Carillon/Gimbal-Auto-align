@@ -1,18 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-#
-# gimbal_autoalign.py  -- SINGLE-FILE runnable script.
-#
-# GIM04 gimbal control + closed-loop, direct-motion beam alignment using VNA feedback.
-# The traditional step/grid scan is still available (mode 3); mode 4 is the closed-loop
-# direct-motion alignment (no full sweep, <= 5 correction passes).
-#
-# This script imports the stock MilliBox modules (mbx_functions, mbx_instrument) that are
-# already installed on the system; everything else (the alignment algorithm and the
-# controller) lives in THIS file, so only this one file needs to be run.
-#
-# Run:  python gimbal_autoalign.py mn
-
 import sys
 import atexit
 import ctypes
