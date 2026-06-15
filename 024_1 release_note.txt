@@ -1,0 +1,429 @@
++++++++++++++++++++++++++++++++++++++++++++++++
+release 024_1
+
+08/31/2025
+
+==============
+Release note:
+==============
+
+---------------
+NEW FEATURES:
+---------------
+- introduce full support for GIM06
+- Document GIM06 support
+
+
+-----------------------
+IMPROVEMENTS AND FIXES:
+-----------------------
+- None
+
+
++++++++++++++++++++++++++++++++++++++++++++++++
+release 024
+
+01/31/2025
+
+==============
+Release note:
+==============
+
+---------------
+NEW FEATURES:
+---------------
+- Upgrade to latest Dynamixel SDK which eliminates all OS driver dependencies but adds pySerial Python module dependency instead.
+- Revoke Apache license and use GPL 3 license instead going forward.
+- Software now detects GIMs automatically, without needing to know the COM port or the baudrate.
+- Get current power measurement command now plots the data if it is VNA data.
+- Save current power measurement to file command now has an option to make multiple measurements.
+
+
+-----------------------
+IMPROVEMENTS AND FIXES:
+-----------------------
+- More positioner connection debug messages added to facilitate troubleshooting. 
+- Fixed bug for HV sweep with GIM04X, polarization is now correctly set to user input value.
+- mbx.cfg is now readable by Python 2, even if it was created by Python 3.
+- Equipment whitelist additions:
+	- Keysight FieldFox VNA
+	- Ceyear 3762 VNA
+	- Anritsu 37269D Lightning VNA
+
+
+
++++++++++++++++++++++++++++++++++++++++++++++++
+release 023.1
+
+9/01/2024
+
+==============
+Release note:
+==============
+
+---------------
+NEW FEATURES:
+---------------
+- New Support for GIM05_FIXED which is GIM05 without HOR05 motorized probe
+- Post-processing to calculate difference between data sets
+- Add functionality for repeated measurements to file
+
+
+-----------------------
+IMPROVEMENTS AND FIXES:
+-----------------------
+- GIM05A is identified with GIM1D in console log at startup
+- Add "quiet" option to suppress error messages during motor identification
+- Display estimated total time and elapsed time progress for all sweeps
+- On abort, VNA does not return to continuous trigger
+- Equipment whitelist additions:
+	- Agilent N524x PNA-X
+	- Agilent E8361A
+	- HP 8722D
+- Post-processing to compute total power starts at second point
+		
+
+
++++++++++++++++++++++++++++++++++++++++++++++++
+release 023
+
+10/13/2023
+
+==============
+Release note:
+==============
+
+---------------
+NEW FEATURES:
+---------------
+- Complete Main Menu redesign, key remapping to streamline control, organized in sections for usability. 
+- Set HOME position is now key 0 and prompt confirmation to prevent accidental press of ENTER key.
+- Added new calibration and correction menu, for gain and absolute power measurement.
+- Added direct measurement to file capture.
+- New VNA supports Mag + Phase mode
+- Complete redesign of motor configuration and control.
+- New motor profile configuration user menu: velocity target, acceleration limiter, and position limiter.
+- Post-processing feature allows power summation of 2 orthogonal captures.
+- Menu for 3D print converts radiation pattern to .stl .
+- Redesigned top layer of mbx_functions.py for external API control.
+- Display/hide test and demo mode menu.
+
+-----------------------
+IMPROVEMENTS AND FIXES:
+-----------------------
+- Improved robustness for maintaining HOME position through power cycle and software crash.
+- Fixed GIM05/04 HOME position restoration bug.
+- Remove test/diagnostic function from menu since it is done at bootup.
+- Document installation on Windows 11.
+
+
+
++++++++++++++++++++++++++++++++++++++++++++++++
+release 022_1
+
+09/28/2023
+
+==============
+Release note:
+==============
+
+---------------
+NEW FEATURES:
+---------------
+- All new features will be in realease 23
+-----------------------
+IMPROVEMENTS AND FIXES:
+-----------------------
+- bugfix matplotlib:
+	- 3d radiation pattern plotting colormap bug
+	- fixes bug introduced in matplotlib 3.8 for colorbar (3d radpat, 2d heatmap)
+- bugfix: 2D heatmap plot crashes for some versions of Python3
+	- error occurs starting with matploblib v3.5 (API replaced b=True flag with visible=True)
+	- use "pip3 list" command to verify module versions installed:
+	- c:\Users\"PCName"\AppData\Local\Programs\Python\Python39\Scripts>pip3 list
+
+
+
++++++++++++++++++++++++++++++++++++++++++++++++
+release 022
+
+08/12/2022
+
+==============
+Release note:
+==============
+
+---------------
+NEW FEATURES:
+---------------
+- Added support for GIM05
+- Zig-zag plot pattern
+- Elapse time presentation during sweeps
+- Electronic auto-align function for all positioners
+- Abort before starting plots using ESC
+- Removed “standard” position accuracy
+- Single trigger support for some instruments
+- New 2D heatmap plot.
+-----------------------
+IMPROVEMENTS AND FIXES:
+-----------------------
+- bugfix: single_trigger for Copper Mountain returns before sweep is complete
+
+
++++++++++++++++++++++++++++++++++++++++++++++++
+release 021_2
+
+04/20/2022
+
+==============
+Release note:
+==============
+
+---------------
+NEW FEATURES:
+---------------
+- MacOS support
+
+-----------------------
+IMPROVEMENTS AND FIXES:
+-----------------------
+- make all directory paths OS agnostic.
+- fix and document MacOS support.
+
+
+
++++++++++++++++++++++++++++++++++++++++++++++++
+release 021_1
+
+02/05/2022
+
+==============
+Release note:
+==============
+
+---------------
+NEW FEATURES:
+---------------
+- Added SOCKET support for VISA connection to software instrument
+- Added a new file mbx_scpi_connection.py for SOCKET/VX11 connection routing
+- Additional instruments supported:
+	- Anritsu Shockline VNA series
+	- Copper Mountain VNA
+
+
+-----------------------
+IMPROVEMENTS AND FIXES:
+-----------------------
+
+
+
++++++++++++++++++++++++++++++++++++++++++++++++
+release 021
+
+01/09/2022
+
+==============
+Release note:
+==============
+
+Major code overhaul and new features:
+---------------
+NEW FEATURES:
+---------------
+- New cleaner directory structure
+- Code support for direct integration into NI VST test system
+- Remove all unused support files for greater portability
+- Added status return to critical functions
+- Velocity setting is not retained across power cycle 
+- Change Desktop Icon Path to reflect new directory structure
+- Use HIGH accuracy setting as default when none specified.
+- Log commands and responses from mbx_visa_shell.py to file visa_log.txt
+- Print software version in shell
+- Global debug flag added in mbx_instrument.py for option to print all VISA traffic
+- mbx_instrument.py compatibility with Py 2.x and Py 3.9
+- Tuned main menus to reflect GIM1D capabilities
+- Additional instruments supported:
+	- Rohde ZVK (older model) driver tested
+	- white list Keysight N5245 VNA
+
+
+-----------------------
+IMPROVEMENTS AND FIXES:
+-----------------------
+- Fixes related to initial velocity settings
+- Fix initial 0 re-alignement in V direction at cold boot.
+
+
++++++++++++++++++++++++++++++++++++++++++++++++
+release 020
+
+07/30/2021
+
+==============
+Release note:
+==============
+
+Major code overhaul and new features:
+---------------
+NEW FEATURES:
+---------------
+- GIM04 base support
+- GIM04 X-Pol support
+- Added polarization control and report
+- Supported compatibility with Python 3.x
+- Added VISA shell for SCPI command test and debug
+- Added standalone program to test instrument drivers
+- Added auto detection of instruments by IDN
+- New instrument whitelist to register new drivers
+- Added auto reconnect to last instruments and config
+- Added new instrument supported:
+	Keysight/Agilent VNA  
+	R&S VNA
+	Agilent PNA
+- Added combo instrument SG+SA support
+
+
+-----------------------
+IMPROVEMENTS AND FIXES:
+-----------------------
+- Acceleration limiter for GIM04 H and V and GIM03 V
+- Turn off torque option when leaving program
+- Straightened program flow structure
+- Added default frequency setting 
+- Simultaneous motor motion for direct move 
+- New class name for instruments.
+- Stop continuous trigger between step in VNA mode
+- Document py-VISApy module required when no VISA drivers installed
+- Time-out on SCPI commands failure 
+- Added current position to main menu
+- Improved isMoving functions
+- Removed unused dynamixel files in code base
+
+
++++++++++++++++++++++++++++++++++++++++++++++++
+
+release 019
+
+01/30/2021
+
+==============
+Release note:
+==============
+
+Major code overhaul and new features:
+---------------
+NEW FEATURES:
+---------------
+- Added support from GIM1D, throughout code and documentation
+- Added support for Anritsu VNA (VectorStar), throughout code and documentation
+- Added sweep playback capabilities with mbx_plot.py and <p> command
+- Added instrument automation capabilities with mbx_test_config.py
+- Added position accuracy settings: Standard, High, Very-High with <e> command
+- Improved accuracy check function <c> command and output.
+- Added initial prompt selection for VNA mode or SA/SigGen mode and mode switch <t> command
+- Added description of new instrument integration in User Manual
+- Added all types of sample sweeps for reference in MilliBox_plot_data
+- Enhanced Manual driver installation procedure in User Manual
+- Added MilliBox icon to desktop shortcut
+- Updated GIM03 DUT platform description to reflect new design in user manual
+- Enhanced description of velocity 'v' command and direct move 'm' command in user manual
+- Added utilities folder for resources such as (drivers, R+ Manager) 
+- Added description of tension ring in User Manual
+- Added Abort <esc> key during sweep
+- changed default plot to <-90, 90, -90, 90, 10> with <d> command
+- changed default step size for manual motion to 11.25deg
+
+
+---------------
+BUG FIXES
+---------------
+- (0,0) position issue at boot-up, workaround offset mishandling of multiturn in Motor Firmware.
+
+---------------
+IMPORTANT WARNING
+---------------
+if upgrading from release 17:
+physical zero position has changed from (0,0) in release 17 to (2048,2048) in absolute step value from release 019 onward
+
+1) before taking the code update move 3D positioner to zero position pressing <h>
+2) upgrade the code to 019
+3) upon boot up and when menu is reached, press ENTER key to reset this position to be your new home position with the 019 new offset handling
+
+
++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+
+
+release 17
+
+04/17/2020
+
+==============
+Release note:
+==============
+
+Major code overhaul and new features:
+- <y> to list and select GPIB resource
+- <x> to get current gimbal location and power measurement
+- <1> to start a 1D sweep
+- <2> to start 2D sweep
+- <3> to start 1D sweep in V and H (E-plane and H-plane)
+- CSV files now include the header and do not have extra lines between data points
+- Added an optional name tag to captured data record files.
+
+
+instrument.py
+- Added many new functions with basic visa communications
+- Added some common SCPI commands for spectrum analyzers and signal generators.
+
+User Manual version and code release version are synchronized.
+
+
++++++++++++++++++++++++++++++++++++++++++++++++
+release 16
+
+02/19/2020
+
+==============
+Release note:
+==============
+
+- redesign of GPIB functions
+- added GPIB instance query command y
+
+
++++++++++++++++++++++++++++++++++++++++++++++++
+release 15
+
+01/31/2020
+
+==============
+Release note:
+==============
+
+- added offset correction on motor H at init from FW43
+- added velocity setting menu
+- added tickle to remember velocity setting across power cycle
+- added direct move to angle (H V) function with travel time log
+- added gettick function to measure elapsed time
+- added GPIB integration sample
+
+
++++++++++++++++++++++++++++++++++++++++++++++++
+release 14
+
+08/22/2019
+
+==============
+Release note:
+==============
+
+- added compatibility for GIM01 and GIM03
+- added check and restore for GIM03 reverse motor setting
+- added MacOS support
+- added check for offset overun
+- added function to reset offset in case of overun
+- added horn description in User manual
+- added GIM03 desciption in User manual
+- added baudrate change function for MacOS
