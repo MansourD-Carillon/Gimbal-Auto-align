@@ -14,14 +14,14 @@ import mbx_instrument as equip
 
 _BAUD = 1000000
 
-# V-axis travel limits relative to power-on position (applied in __init__)
-V_LIMIT_LOWER = -60.0      # max degrees below power-on V angle
-V_LIMIT_UPPER =  60.0          # max degrees above power-on V angle
+# V-axis absolute travel limits (degrees from motor mechanical zero)
+V_LIMIT_LOWER = -60.0           # absolute lower bound for V axis
+V_LIMIT_UPPER =  60.0           # absolute upper bound for V axis
 
-# Adaptive sweep speed settings — tuned for a 2 kg antenna load
-SCAN_SPEED_NEAR_DPS  = 0.5      # slow speed near the target angle
-SCAN_SPEED_MID_DPS   = 2.0      # medium speed away from target
-SCAN_SPEED_FAR_DPS   = 5.0      # max sweep speed (reduced for 2 kg load)
+# Adaptive sweep speed settings — tuned for a 1 kg antenna load
+SCAN_SPEED_NEAR_DPS  = 1.0      # slow speed near the target angle
+SCAN_SPEED_MID_DPS   = 4.0      # medium speed away from target
+SCAN_SPEED_FAR_DPS   = 10.0     # max sweep speed
 SCAN_SPEED_SCALE     = 1.0      # global aggressiveness multiplier
 SCAN_NEAR_RADIUS_DEG = 5.0      # use slow speed within this many degrees of target
 SCAN_FAST_RADIUS_DEG = 10.0     # use medium speed up to this many degrees
@@ -517,22 +517,20 @@ class GimbalController:
         self._connected = True
         mbx.set_gim_motion_default()
 
-        # Record V position at power-on as the session reference — no homing on startup
-        _v_origin = mbx.convertpostoangle(mbx.V, mbx.current_pos(mbx.V, 1))
-        self._v_abs_min = _v_origin + V_LIMIT_LOWER
-        self._v_abs_max = _v_origin + V_LIMIT_UPPER
+        # Fixed absolute V limits — independent of power-on position
+        self._v_abs_min = V_LIMIT_LOWER
+        self._v_abs_max = V_LIMIT_UPPER
         # Propagate into the MBX motion table so mbx.move_angle() also enforces the limits
         mbx.get_gim_motion()[2]["anglelim"] = [self._v_abs_min, self._v_abs_max]
 
-        # Conservative acceleration for a 2 kg antenna load (H, V, P)
+        # Acceleration tuned for a 1 kg antenna load (H, V, P)
         try:
-            mbx.set_accel(8, 5, 5)
+            mbx.set_accel(16, 10, 10)
         except Exception:
             pass
 
         atexit.register(self._on_exit)
-        print(f"V-axis limits: [{self._v_abs_min:.1f}°, {self._v_abs_max:.1f}°]  "
-              f"(power-on V = {_v_origin:.1f}°)")
+        print(f"V-axis limits (absolute): [{self._v_abs_min:.1f}°, {self._v_abs_max:.1f}°]")
         self._print_position()
 
     def _require_connection(self):
@@ -540,7 +538,7 @@ class GimbalController:
             raise RuntimeError("Positioner is not connected")
 
     def _guard_v(self, angle):
-        """Proactive V-limit guard: clamp target to the session safe window and warn.
+        """Proactive V-limit guard: clamp target to the absolute safe window and warn.
 
         This is the primary enforcement layer — call before every V move so the limit
         is never physically reached during normal operation.
@@ -1448,7 +1446,7 @@ class GimbalController:
     # ------------------------------------------------------------------------------------------------------------------
 
     def move_with_pid(self, h=None, v=None,
-                      kv=1.6, v_min=1.0, v_max=14.6,
+                      kv=1.6, v_min=1.0, v_max=10.0,
                       tolerance=0.1, max_time=30.0,
                       poll_interval=0.05, plot=True, verbose=True):
         """Move to (h, v) with velocity-proportional position correction, then fine-settle.
