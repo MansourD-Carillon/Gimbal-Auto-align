@@ -22,9 +22,9 @@ V_LIMIT_UPPER =  60.0           # absolute upper bound for V axis
 V_SWEEP_MARGIN_DEG = 3.0
 
 # Adaptive sweep speed settings — tuned for a 1 kg antenna load
-SCAN_SPEED_NEAR_DPS  = 2.0      # slow speed near the target angle
-SCAN_SPEED_MID_DPS   = 6.0      # medium speed away from target
-SCAN_SPEED_FAR_DPS   = 15.0     # max sweep speed
+SCAN_SPEED_NEAR_DPS  = 1.0      # slow speed near the target angle
+SCAN_SPEED_MID_DPS   = 3.0      # medium speed away from target
+SCAN_SPEED_FAR_DPS   = 8.0      # max sweep speed
 SCAN_SPEED_SCALE     = 1.0      # global aggressiveness multiplier
 SCAN_NEAR_RADIUS_DEG = 5.0      # use slow speed within this many degrees of target
 SCAN_FAST_RADIUS_DEG = 10.0     # use medium speed up to this many degrees
@@ -1028,7 +1028,7 @@ class GimbalController:
         print("Parked at the strongest measured VNA direction.")
         self.run_keyboard_control(start_h=best_h, start_v=best_v)
 
-    def run_velocity_scan(self, kv=0.8, v_min=0.5, v_max=15.0,
+    def run_velocity_scan(self, kv=0.8, v_min=0.5, v_max=8.0,
                           poll_interval=0.05, tolerance=0.1, plot=True):
         """Proportional-velocity VNA scan + precision park at the measured peak.
 
@@ -1441,19 +1441,20 @@ class GimbalController:
     # ------------------------------------------------------------------------------------------------------------------
 
     def move_with_pid(self, h=None, v=None,
-                      kv=1.6, v_min=1.0, v_max=15.0,
+                      kv=1.6, v_min=1.0, v_max=8.0,
+                      h_speed=15.0,
                       tolerance=0.1, max_time=30.0,
                       poll_interval=0.05, plot=True, verbose=True):
-        """Move to (h, v) with velocity-proportional position correction, then fine-settle.
+        """Move to (h, v), then fine-settle.
 
-        Each poll tick the loop reads position, computes error, and sets motor velocity
-        proportional to that error: vel = clamp(Kv * |error|, v_min, v_max) dps.
-        Large errors produce fast motion; small errors slow to a creep. Once both axes
-        sit within *tolerance* degrees the velocity loop exits and a final blocking
-        mbx.move_angle(accuracy="VERY HIGH") step eliminates residual backlash via the
-        SDK's built-in overshoot-then-approach correction.
+        H moves at a constant h_speed (dps) throughout — no proportional scaling.
+        V uses proportional velocity: clamp(Kv × |error|, v_min, v_max) dps,
+        slowing to a creep as it approaches the target.
+        Once both axes are within *tolerance* degrees for 3 consecutive ticks the
+        loop exits and mbx.move_angle(accuracy="VERY HIGH") eliminates residual
+        backlash via the SDK's built-in overshoot-then-approach correction.
 
-        verbose=False suppresses per-tick table output (used by tune_velocity_controller).
+        verbose=False suppresses per-tick table output.
         Returns the log dict.
         """
         self._require_connection()
@@ -1479,7 +1480,7 @@ class GimbalController:
         if verbose:
             print(f"\n{SEP}")
             print(f"  VELOCITY-CONTROLLED MOVE  →  H={h_target:.3f}°  V={v_target:.3f}°")
-            print(f"  Kv={kv} dps/°  range=[{v_min}, {v_max}] dps  tol=±{tolerance}°")
+            print(f"  H: {h_speed} dps constant  |  V: clamp({kv}×|err|, {v_min}, {v_max}) dps  tol=±{tolerance}°")
             print(SEP)
             print(f"{'t(s)':>7}  {'H actual':>10}  {'H error':>9}  {'vel_H':>7}"
                   f"  {'V actual':>10}  {'V error':>9}  {'vel_V':>7}")
@@ -1495,7 +1496,7 @@ class GimbalController:
             h_err = h_target - h_act
             v_err = v_target - v_act
 
-            vel_h = _clamp(kv * abs(h_err), v_min, v_max)
+            vel_h = h_speed
             vel_v = _clamp(kv * abs(v_err), v_min, v_max)
 
             log["t"].append(elapsed)
