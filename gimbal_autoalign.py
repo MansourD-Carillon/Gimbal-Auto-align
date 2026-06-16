@@ -37,7 +37,7 @@ SCAN_FAST_RADIUS_DEG = 10.0     # use medium speed up to this many degrees
 #                             still real and really moves, so this is a full end-to-end test of the alignment.
 #   SIMULATE_VNA = False  ->  connect to a real VNA over the ethernet (raw TCPIP SOCKET) at VNA_ADDRESS.
 SIMULATE_VNA = True
-VNA_ADDRESS  = "TCPIP0::192.168.6.150::9001::SOCKET"     # real VNA, used only when SIMULATE_VNA = False
+VNA_ADDRESS  = "TCPIP0::ANRITSU-VNA::inst0::INSTR"     # real VNA, used only when SIMULATE_VNA = False
 
 # Convenience aliases for the motor / gimbal-type constants (these never change at runtime)
 H = mbx.H
@@ -1678,6 +1678,24 @@ class GimbalController:
         plt.tight_layout()
         plt.show()
 
+    def _hold_torque(self):
+        """Lock all motors at their current encoder position before the COM port closes.
+
+        Dynamixel PH42 motors may disable torque when the host disconnects. Issuing a
+        move_pos to the current position with velocity=0 freezes the position controller
+        so the motor maintains that target — and its torque — after the serial port closes.
+        """
+        try:
+            mbx.set_velocity(0, 0, 0)
+            for motor in (mbx.H, mbx.V, mbx.P):
+                try:
+                    cur = mbx.current_pos(motor, 1)
+                    mbx.move_pos(motor, cur)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def close(self):
         if self._connected:
             try:
@@ -1685,6 +1703,7 @@ class GimbalController:
                 mbx.gotoZERO(accuracy="HIGH")
             except Exception:
                 pass
+            self._hold_torque()
             try:
                 mbx.close()
             except Exception:
@@ -1703,6 +1722,7 @@ class GimbalController:
                 mbx.gotoZERO(accuracy="HIGH")
             except Exception:
                 pass
+            self._hold_torque()
             try:
                 mbx.close()
             except Exception:
