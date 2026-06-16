@@ -505,7 +505,7 @@ def beam_align_directmotion(inst, **kwargs):
 
 class GimbalController:
 
-    def __init__(self, port="COM3"):
+    def __init__(self, port="COM7"):
         self._port = port
         self._connected = False
         self._vna = None
@@ -523,9 +523,9 @@ class GimbalController:
         # Propagate into the MBX motion table so mbx.move_angle() also enforces the limits
         mbx.get_gim_motion()[2]["anglelim"] = [self._v_abs_min, self._v_abs_max]
 
-        # Acceleration tuned for a 1 kg antenna load (H, V, P)
+        # H=16 keeps azimuth snappy; V=4 gives a long ramp to reduce jerk under 1 kg load
         try:
-            mbx.set_accel(16, 10, 10)
+            mbx.set_accel(16, 4, 10)
         except Exception:
             pass
 
@@ -788,15 +788,10 @@ class GimbalController:
             v_start = v_lo if sweep_up else v_hi
             v_end   = v_hi if sweep_up else v_lo
 
-            # V sweep velocity — adaptive near target_h, full speed otherwise
+            # V sweep velocity — linearly interpolated from NEAR at boresight to FAR at FAST_RADIUS
             if target_h is not None:
-                delta = abs(h_col - target_h)
-                if delta <= SCAN_NEAR_RADIUS_DEG:
-                    v_vel = SCAN_SPEED_NEAR_DPS
-                elif delta <= SCAN_FAST_RADIUS_DEG:
-                    v_vel = SCAN_SPEED_MID_DPS
-                else:
-                    v_vel = SCAN_SPEED_FAR_DPS
+                t = min(abs(h_col - target_h) / SCAN_FAST_RADIUS_DEG, 1.0)
+                v_vel = SCAN_SPEED_NEAR_DPS + t * (SCAN_SPEED_FAR_DPS - SCAN_SPEED_NEAR_DPS)
             else:
                 v_vel = SCAN_SPEED_FAR_DPS
 
@@ -903,20 +898,12 @@ class GimbalController:
         target_v = 0.0
 
         def _speed_for_angle(h_angle):
-            delta = abs(h_angle - target_h)
-            if delta <= SCAN_NEAR_RADIUS_DEG:
-                return SCAN_SPEED_NEAR_DPS * SCAN_SPEED_SCALE
-            if delta <= SCAN_FAST_RADIUS_DEG:
-                return SCAN_SPEED_MID_DPS * SCAN_SPEED_SCALE
-            return SCAN_SPEED_FAR_DPS * SCAN_SPEED_SCALE
+            t = min(abs(h_angle - target_h) / SCAN_FAST_RADIUS_DEG, 1.0)
+            return (SCAN_SPEED_NEAR_DPS + t * (SCAN_SPEED_FAR_DPS - SCAN_SPEED_NEAR_DPS)) * SCAN_SPEED_SCALE
 
         def _speed_for_v(v_angle):
-            delta = abs(v_angle - target_v)
-            if delta <= SCAN_NEAR_RADIUS_DEG:
-                return SCAN_SPEED_NEAR_DPS * SCAN_SPEED_SCALE
-            if delta <= SCAN_FAST_RADIUS_DEG:
-                return SCAN_SPEED_MID_DPS * SCAN_SPEED_SCALE
-            return SCAN_SPEED_FAR_DPS * SCAN_SPEED_SCALE
+            t = min(abs(v_angle - target_v) / SCAN_FAST_RADIUS_DEG, 1.0)
+            return (SCAN_SPEED_NEAR_DPS + t * (SCAN_SPEED_FAR_DPS - SCAN_SPEED_NEAR_DPS)) * SCAN_SPEED_SCALE
 
         h_lo = self._v_abs_min   # -60°
         h_hi = self._v_abs_max   # +60°
@@ -976,9 +963,13 @@ class GimbalController:
 
         mbx.set_velocity(0, 0, 0)
 
-        # Continuous V sweep around the best H found above, using the same adaptive speed logic.
-        print("\nNow sweeping V continuously around the best H found from the H scan...")
-        mbx.move_angle(hang=best_h, vang=self._v_abs_min, accuracy="HIGH")
+        # Return to origin, then V sweep at H=0.
+        print("\nReturning to (H=0°, V=0°) before V sweep...")
+        mbx.move_angle(hang=0.0, vang=self._guard_v(0.0), accuracy="HIGH")
+        time.sleep(0.1)
+
+        print(f"\nPhase 2: V sweep [{self._v_abs_min:.1f}°, {self._v_abs_max:.1f}°] at H=0°")
+        mbx.move_angle(hang=0.0, vang=self._guard_v(self._v_abs_min), accuracy="HIGH")
         time.sleep(0.1)
 
         v_goal_pos = mbx.convertangletopos(mbx.V, self._v_abs_max)
@@ -1126,11 +1117,16 @@ class GimbalController:
 
         mbx.set_velocity(0, 0, 0)
 
-        # ---- Phase 2: V sweep at best H ----
-        print(f"\nPhase 2: V sweep [{self._v_abs_min:.1f}°, {self._v_abs_max:.1f}°] at H={best_h:.2f}°  "
+        # ---- Return to origin between sweeps ----
+        print("\nReturning to (H=0°, V=0°) before V sweep...")
+        mbx.move_angle(hang=0.0, vang=self._guard_v(0.0), accuracy="HIGH")
+        time.sleep(0.1)
+
+        # ---- Phase 2: V sweep at H=0 ----
+        print(f"\nPhase 2: V sweep [{self._v_abs_min:.1f}°, {self._v_abs_max:.1f}°] at H=0°  "
               f"vel = clamp({kv}×|V|, {v_min}, {v_max}) dps — slower near boresight (0°)")
 
-        mbx.move_angle(hang=best_h, vang=self._v_abs_min, accuracy="HIGH")
+        mbx.move_angle(hang=0.0, vang=self._guard_v(self._v_abs_min), accuracy="HIGH")
         time.sleep(0.1)
 
         v_scan_ang = []
@@ -1744,7 +1740,7 @@ if __name__ == "__main__":
         else:
             gim.connect_vna(VNA_ADDRESS)
 
-    with GimbalController(port="COM3") as gim:
+    with GimbalController(port="COM7") as gim:
         if choice == "2":
             _attach_vna(gim)
             gim.run_keyboard_control()
