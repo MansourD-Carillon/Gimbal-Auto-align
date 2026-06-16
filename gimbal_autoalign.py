@@ -19,9 +19,9 @@ V_LIMIT_LOWER = -60.0           # absolute lower bound for V axis
 V_LIMIT_UPPER =  60.0           # absolute upper bound for V axis
 
 # Adaptive sweep speed settings — tuned for a 1 kg antenna load
-SCAN_SPEED_NEAR_DPS  = 1.0      # slow speed near the target angle
-SCAN_SPEED_MID_DPS   = 4.0      # medium speed away from target
-SCAN_SPEED_FAR_DPS   = 10.0     # max sweep speed
+SCAN_SPEED_NEAR_DPS  = 2.0      # slow speed near the target angle
+SCAN_SPEED_MID_DPS   = 6.0      # medium speed away from target
+SCAN_SPEED_FAR_DPS   = 15.0     # max sweep speed
 SCAN_SPEED_SCALE     = 1.0      # global aggressiveness multiplier
 SCAN_NEAR_RADIUS_DEG = 5.0      # use slow speed within this many degrees of target
 SCAN_FAST_RADIUS_DEG = 10.0     # use medium speed up to this many degrees
@@ -891,26 +891,16 @@ class GimbalController:
         self.run_keyboard_control(start_h=best_h, start_v=best_v)
 
     def run_adaptive_scan(self):
-        """Continuous adaptive-speed H sweep that uses the measured VNA peak to steer toward the target."""
+        """Continuous adaptive-speed H then V scan — speed reduces within ±10° of boresight (0°, 0°)."""
         self._require_connection()
         if self._vna is None:
             raise RuntimeError("VNA not connected — call connect_vna() first")
 
         t0 = time.time()
 
-        try:
-            print("Enter the target H angle in degrees (relative to the current H-axis center).")
-            target_h = float(input("Enter target H angle in degrees: ").strip())
-        except Exception:
-            print("Invalid angle entered; using 0.0 degrees as the target center.")
-            target_h = 0.0
-
-        try:
-            print("Enter the target V angle in degrees (used to shape V sweep velocity).")
-            target_v = float(input("Enter target V angle in degrees: ").strip())
-        except Exception:
-            print("Invalid angle entered; using 0.0 degrees as the V target.")
-            target_v = 0.0
+        # Boresight is always (0°, 0°) — no user input needed
+        target_h = 0.0
+        target_v = 0.0
 
         def _speed_for_angle(h_angle):
             delta = abs(h_angle - target_h)
@@ -928,27 +918,31 @@ class GimbalController:
                 return SCAN_SPEED_MID_DPS * SCAN_SPEED_SCALE
             return SCAN_SPEED_FAR_DPS * SCAN_SPEED_SCALE
 
-        print("\nStarting continuous adaptive sweep  H=%.2f deg  V=%.2f deg" % (target_h, target_v))
-        print("  within %.1f deg -> %.1f dps" % (SCAN_NEAR_RADIUS_DEG, SCAN_SPEED_NEAR_DPS))
-        print("  within %.1f deg -> %.1f dps" % (SCAN_FAST_RADIUS_DEG, SCAN_SPEED_MID_DPS))
-        print("  beyond %.1f deg -> %.1f dps" % (SCAN_FAST_RADIUS_DEG, SCAN_SPEED_FAR_DPS))
+        h_lo = self._v_abs_min   # -60°
+        h_hi = self._v_abs_max   # +60°
+
+        print(f"\nStarting continuous adaptive scan  H [{h_lo:.1f}°, {h_hi:.1f}°]  "
+              f"V [{self._v_abs_min:.1f}°, {self._v_abs_max:.1f}°]")
+        print("  within %.1f deg of boresight -> %.1f dps" % (SCAN_NEAR_RADIUS_DEG, SCAN_SPEED_NEAR_DPS))
+        print("  within %.1f deg of boresight -> %.1f dps" % (SCAN_FAST_RADIUS_DEG, SCAN_SPEED_MID_DPS))
+        print("  beyond %.1f deg of boresight -> %.1f dps" % (SCAN_FAST_RADIUS_DEG, SCAN_SPEED_FAR_DPS))
 
         try:
             self._vna.fix_status()
         except Exception:
             pass
 
-        mbx.move_angle(vang=self._guard_v(0.0), hang=-180.0, accuracy="HIGH")
+        mbx.move_angle(vang=self._guard_v(0.0), hang=h_lo, accuracy="HIGH")
         time.sleep(0.1)
 
-        best_h = -180.0
+        best_h = h_lo
         best_v = 0.0
         best_db = float("-inf")
         last_vel = None
 
         # Continuous H sweep across the full range.
-        h_goal_pos = mbx.convertangletopos(mbx.H, 180.0)
-        mbx.set_velocity(_speed_for_angle(-180.0), 0, 0)
+        h_goal_pos = mbx.convertangletopos(mbx.H, h_hi)
+        mbx.set_velocity(_speed_for_angle(h_lo), 0, 0)
         mbx.move_pos(mbx.H, h_goal_pos)
 
         done_tol_pos = abs(mbx.convertangletopos(mbx.H, 1.0) - mbx.convertangletopos(mbx.H, 0.0))
@@ -1037,19 +1031,16 @@ class GimbalController:
         print("Parked at the strongest measured VNA direction.")
         self.run_keyboard_control(start_h=best_h, start_v=best_v)
 
-    def run_velocity_scan(self, kv=0.8, v_min=0.5, v_max=5.0,
+    def run_velocity_scan(self, kv=0.8, v_min=0.5, v_max=15.0,
                           poll_interval=0.05, tolerance=0.1, plot=True):
         """Proportional-velocity VNA scan + precision park at the measured peak.
 
         Three phases:
-          1. H sweep  (-180° → +180°) with velocity = clamp(Kv × |H − target_h|, v_min, v_max).
-             Slower near the suggested target, faster far away.
-          2. V sweep  (-180° → +180°) at the best H found, same proportional profile vs target_v.
+          1. H sweep  (−60° → +60°) with velocity = clamp(Kv × |H|, v_min, v_max).
+             Slower near boresight (0°), faster far away.
+          2. V sweep  (−60° → +60°) at the best H found, same proportional profile vs 0°.
           3. Precision park at the VNA peak using velocity-proportional approach then
              VERY HIGH accuracy fine-settle (move_with_pid).
-
-        The target angles are user-supplied hints that shape the scan velocity — the VNA
-        determines the actual final pointing direction.
         """
         self._require_connection()
         if self._vna is None:
@@ -1057,17 +1048,12 @@ class GimbalController:
 
         t0 = time.time()
 
-        try:
-            target_h = float(input("Suggested H angle — scan slows near here (degrees): ").strip())
-        except Exception:
-            print("Invalid; using 0.0°.")
-            target_h = 0.0
+        # Boresight is always (0°, 0°) — no user input needed
+        target_h = 0.0
+        target_v = 0.0
 
-        try:
-            target_v = float(input("Suggested V angle — scan slows near here (degrees): ").strip())
-        except Exception:
-            print("Invalid; using 0.0°.")
-            target_v = 0.0
+        h_lo = self._v_abs_min   # -60°
+        h_hi = self._v_abs_max   # +60°
 
         def _vel(angle, hint):
             return _clamp(kv * abs(angle - hint), v_min, v_max)
@@ -1076,18 +1062,18 @@ class GimbalController:
             k = ctypes.windll.user32.GetAsyncKeyState
             return bool(k(0x51) & 0x8000) or bool(k(0x1B) & 0x8000)  # Q or ESC
 
-        print(f"\nPhase 1: H sweep  hint={target_h:.2f}°  "
-              f"vel = clamp({kv}×|H−{target_h:.1f}°|, {v_min}, {v_max}) dps")
+        print(f"\nPhase 1: H sweep [{h_lo:.1f}°, {h_hi:.1f}°]  "
+              f"vel = clamp({kv}×|H|, {v_min}, {v_max}) dps — slower near boresight (0°)")
 
         try:
             self._vna.fix_status()
         except Exception:
             pass
 
-        mbx.move_angle(vang=self._guard_v(0.0), hang=-270.0, accuracy="HIGH")
+        mbx.move_angle(vang=self._guard_v(0.0), hang=h_lo, accuracy="HIGH")
         time.sleep(0.1)
 
-        best_h = -270.0
+        best_h = h_lo
         best_v = 0.0
         best_db = float("-inf")
         h_scan_ang = []
@@ -1097,8 +1083,8 @@ class GimbalController:
         if done_tol_h < 1:
             done_tol_h = 1
 
-        h_goal_pos = mbx.convertangletopos(mbx.H, 90.0)
-        mbx.set_velocity(_vel(-270.0, target_h), 0, 0)
+        h_goal_pos = mbx.convertangletopos(mbx.H, h_hi)
+        mbx.set_velocity(_vel(h_lo, target_h), 0, 0)
         mbx.move_pos(mbx.H, h_goal_pos)
 
         while True:
@@ -1141,8 +1127,8 @@ class GimbalController:
         mbx.set_velocity(0, 0, 0)
 
         # ---- Phase 2: V sweep at best H ----
-        print(f"\nPhase 2: V sweep at H={best_h:.2f}°  hint={target_v:.2f}°  "
-              f"vel = clamp({kv}×|V−{target_v:.1f}°|, {v_min}, {v_max}) dps")
+        print(f"\nPhase 2: V sweep [{self._v_abs_min:.1f}°, {self._v_abs_max:.1f}°] at H={best_h:.2f}°  "
+              f"vel = clamp({kv}×|V|, {v_min}, {v_max}) dps — slower near boresight (0°)")
 
         mbx.move_angle(hang=best_h, vang=self._v_abs_min, accuracy="HIGH")
         time.sleep(0.1)
@@ -1453,7 +1439,7 @@ class GimbalController:
     # ------------------------------------------------------------------------------------------------------------------
 
     def move_with_pid(self, h=None, v=None,
-                      kv=1.6, v_min=1.0, v_max=10.0,
+                      kv=1.6, v_min=1.0, v_max=15.0,
                       tolerance=0.1, max_time=30.0,
                       poll_interval=0.05, plot=True, verbose=True):
         """Move to (h, v) with velocity-proportional position correction, then fine-settle.
