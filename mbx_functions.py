@@ -268,8 +268,8 @@ XH540_P_ACCEL_HARD_LIMIT    = [1, 100]                  # Min/max for accel limi
 XH540_T_ACCEL_HARD_LIMIT    = [1, 100]                  # Min/max for accel limit setting (XH540 T motor)
 XH540_Z_ACCEL_HARD_LIMIT    = [1, 100]                  # Min/max for accel limit setting (XH540 Z motor)
 
-H_ANGLE_HARD_LIMIT          = [-180, 180]               # Min/max for angle limit setting (H motor)
-V_ANGLE_HARD_LIMIT          = [-180, 180]               # Min/max for angle limit setting (V motor)
+H_ANGLE_HARD_LIMIT          = [-60, 60]               # Min/max for angle limit setting (H motor)
+V_ANGLE_HARD_LIMIT          = [-60, 60]               # Min/max for angle limit setting (V motor)
 P_ANGLE_HARD_LIMIT          = [-180, 180]               # Min/max for angle limit setting (P motor)
 T_ANGLE_HARD_LIMIT          = [-180, 180]               # Min/max for angle limit setting (T motor)
 Z_ANGLE_HARD_LIMIT          = [-180, 180]               # Min/max for angle limit setting (Z motor)
