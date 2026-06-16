@@ -13,15 +13,17 @@ import mbx_functions as mbx
 import mbx_instrument as equip
 
 _BAUD = 1000000
-_ANGLE_MIN = -180.0
-_ANGLE_MAX = 180.0
 
-# Adaptive sweep speed settings (easy to tune at the top of the file)
-SCAN_SPEED_NEAR_DPS = 1.0      # slow speed near the target angle
-SCAN_SPEED_MID_DPS = 7.0      # faster speed away from the target center
-SCAN_SPEED_FAR_DPS = 14.7     # even faster speed farther away
-SCAN_SPEED_SCALE = 1.0         # global aggressiveness multiplier for all sweep speeds
-SCAN_NEAR_RADIUS_DEG = 5.0     # use slow speed within this many degrees of target
+# V-axis travel limits relative to power-on position (applied in __init__)
+V_LIMIT_LOWER = -60.0      # max degrees below power-on V angle
+V_LIMIT_UPPER =  60.0          # max degrees above power-on V angle
+
+# Adaptive sweep speed settings — tuned for a 2 kg antenna load
+SCAN_SPEED_NEAR_DPS  = 0.5      # slow speed near the target angle
+SCAN_SPEED_MID_DPS   = 2.0      # medium speed away from target
+SCAN_SPEED_FAR_DPS   = 5.0      # max sweep speed (reduced for 2 kg load)
+SCAN_SPEED_SCALE     = 1.0      # global aggressiveness multiplier
+SCAN_NEAR_RADIUS_DEG = 5.0      # use slow speed within this many degrees of target
 SCAN_FAST_RADIUS_DEG = 10.0     # use medium speed up to this many degrees
 
 # ======================================================================================================================
@@ -514,39 +516,75 @@ class GimbalController:
             )
         self._connected = True
         mbx.set_gim_motion_default()
+
+        # Record V position at power-on as the session reference — no homing on startup
+        _v_origin = mbx.convertpostoangle(mbx.V, mbx.current_pos(mbx.V, 1))
+        self._v_abs_min = _v_origin + V_LIMIT_LOWER
+        self._v_abs_max = _v_origin + V_LIMIT_UPPER
+        # Propagate into the MBX motion table so mbx.move_angle() also enforces the limits
+        mbx.get_gim_motion()[2]["anglelim"] = [self._v_abs_min, self._v_abs_max]
+
+        # Conservative acceleration for a 2 kg antenna load (H, V, P)
         try:
-            mbx.gotoZERO(accuracy="HIGH")
+            mbx.set_accel(8, 5, 5)
         except Exception:
             pass
+
         atexit.register(self._on_exit)
+        print(f"V-axis limits: [{self._v_abs_min:.1f}°, {self._v_abs_max:.1f}°]  "
+              f"(power-on V = {_v_origin:.1f}°)")
         self._print_position()
 
     def _require_connection(self):
         if not self._connected:
             raise RuntimeError("Positioner is not connected")
 
-    def _validate_angle(self, axis, angle):
-        if not (_ANGLE_MIN <= angle <= _ANGLE_MAX):
-            raise ValueError(
-                f"{axis} angle {angle:.4f}° is outside [{_ANGLE_MIN}, {_ANGLE_MAX}]"
+    def _guard_v(self, angle):
+        """Proactive V-limit guard: clamp target to the session safe window and warn.
+
+        This is the primary enforcement layer — call before every V move so the limit
+        is never physically reached during normal operation.
+        """
+        if angle < self._v_abs_min:
+            print(f"*** V-limit: {angle:.3f}° is below floor {self._v_abs_min:.1f}° — clamped")
+            return self._v_abs_min
+        if angle > self._v_abs_max:
+            print(f"*** V-limit: {angle:.3f}° exceeds ceiling {self._v_abs_max:.1f}° — clamped")
+            return self._v_abs_max
+        return angle
+
+    def _assert_v_in_bounds(self):
+        """Reactive V-limit fallback: stop V motion and raise if the axis is outside limits.
+
+        Call after any move command as a safety net in case the proactive guard was bypassed.
+        """
+        v_now = mbx.convertpostoangle(mbx.V, mbx.current_pos(mbx.V, 1))
+        if v_now < self._v_abs_min or v_now > self._v_abs_max:
+            try:
+                # Cancel any ongoing V move by commanding current position
+                mbx.move_pos(mbx.V, mbx.current_pos(mbx.V, 1))
+            except Exception:
+                pass
+            which = "lower" if v_now < self._v_abs_min else "upper"
+            limit = self._v_abs_min if v_now < self._v_abs_min else self._v_abs_max
+            raise RuntimeError(
+                f"V-axis {which} limit breached: current={v_now:.3f}°, limit={limit:.1f}°"
             )
+
+    def _validate_angle(self, axis, angle):
+        pass  # superseded by _guard_v() for V; H is unrestricted
 
     def move(self, h=None, v=None):
         self._require_connection()
         if h is None and v is None:
             raise ValueError("At least one of h or v must be provided")
-        if h is not None:
-            self._validate_angle("H", h)
         if v is not None:
-            self._validate_angle("V", v)
+            v = self._guard_v(v)                       # proactive clamp
         ok = mbx.move_angle(hang=h, vang=v, accuracy="HIGH")
         self._print_position()
-        try:
-            if not ok:
-                raise RuntimeError(f"move_angle failed — H={h}, V={v}")
-        finally:
-            mbx.gotoZERO(accuracy="HIGH")
-            self._print_position()
+        self._assert_v_in_bounds()                     # reactive fallback
+        if not ok:
+            raise RuntimeError(f"move_angle failed — H={h}, V={v}")
 
     def move_h(self, angle):
         self.move(h=angle)
@@ -565,12 +603,11 @@ class GimbalController:
         self._require_connection()
         if h is None and v is None:
             raise ValueError("At least one of h or v must be provided")
-        if h is not None:
-            self._validate_angle("H", h)
         if v is not None:
-            self._validate_angle("V", v)
+            v = self._guard_v(v)                       # proactive clamp
         ok = mbx.move_angle(hang=h, vang=v, accuracy=accuracy)
         self._print_position()
+        self._assert_v_in_bounds()                     # reactive fallback
         if not ok:
             raise RuntimeError(f"move_angle failed — H={h}, V={v}")
         return ok
@@ -622,6 +659,12 @@ class GimbalController:
 
     def home(self):
         self._require_connection()
+        if not (self._v_abs_min <= 0.0 <= self._v_abs_max):
+            raise RuntimeError(
+                f"home() blocked: absolute 0° is outside V limits "
+                f"[{self._v_abs_min:.1f}°, {self._v_abs_max:.1f}°]. "
+                f"Homing would breach the V limit — move manually instead."
+            )
         mbx.gotoZERO(accuracy="HIGH")
         self._print_position()
 
@@ -693,7 +736,8 @@ class GimbalController:
         a, b = result if result is not None else (None, None)
         if a is None or b is None:
             print("\nAlignment did not complete (aborted, wrong gimbal type, or no VNA data).")
-            self.home()
+            print("Gimbal parked at current position — no automatic movement.")
+            self._print_position()
             return None
 
         # the alignment already performed the final direct move to the peak; report + verify
@@ -708,48 +752,93 @@ class GimbalController:
         return a, b
 
     def _grid_scan(self, h_lo, h_hi, h_step, v_lo, v_hi, v_step, label, target_h=None):
+        # Clip V range to session limits
+        v_lo = max(v_lo, self._v_abs_min)
+        v_hi = min(v_hi, self._v_abs_max)
+        if v_lo >= v_hi:
+            print(f"*** {label}: V range is entirely outside limits "
+                  f"[{self._v_abs_min:.1f}°, {self._v_abs_max:.1f}°] — scan skipped")
+            return 0.0, 0.0, float("-inf")
+
+        # Build H column list
         h_angles = []
         h = h_lo
         while h <= h_hi + h_step * 0.01:
             h_angles.append(round(h, 4))
             h += h_step
 
-        v_angles = []
-        v = v_lo
-        while v <= v_hi + v_step * 0.01:
-            v_angles.append(round(v, 4))
-            v += v_step
+        total_cols = len(h_angles)
+        print(f"\n{label} scan: {total_cols} H cols × V [{v_lo:.1f}°→{v_hi:.1f}°]  "
+              f"(~{v_step:.1f}° grid)  continuous fly-by zigzag")
 
-        total = len(h_angles) * len(v_angles)
-        print(f"\n{label} scan: {len(h_angles)} H x {len(v_angles)} V = {total} points")
+        # One encoder step as the V-done tolerance
+        done_tol_v = abs(mbx.convertangletopos(mbx.V, 1.0) - mbx.convertangletopos(mbx.V, 0.0))
+        if done_tol_v < 1:
+            done_tol_v = 1
 
         best_h, best_v, best_db = 0.0, 0.0, float("-inf")
-        count = 0
-        for h in h_angles:
-            for v in v_angles:
-                count += 1
-                if target_h is not None:
-                    delta = abs(h - target_h)
-                    if delta <= SCAN_NEAR_RADIUS_DEG:
-                        vel = SCAN_SPEED_NEAR_DPS
-                    elif delta <= SCAN_FAST_RADIUS_DEG:
-                        vel = SCAN_SPEED_MID_DPS
-                    else:
-                        vel = SCAN_SPEED_FAR_DPS
-                    mbx.set_velocity(vel, 0, 0)
-                mbx.move_angle(hang=h, vang=v, accuracy="HIGH")
-                data = self.measure()
-                peak = max(data["db"])
+        sweep_up = True         # zigzag: alternate V sweep direction each column
+
+        for col_idx, h_col in enumerate(h_angles):
+            v_start = v_lo if sweep_up else v_hi
+            v_end   = v_hi if sweep_up else v_lo
+
+            # V sweep velocity — adaptive near target_h, full speed otherwise
+            if target_h is not None:
+                delta = abs(h_col - target_h)
+                if delta <= SCAN_NEAR_RADIUS_DEG:
+                    v_vel = SCAN_SPEED_NEAR_DPS
+                elif delta <= SCAN_FAST_RADIUS_DEG:
+                    v_vel = SCAN_SPEED_MID_DPS
+                else:
+                    v_vel = SCAN_SPEED_FAR_DPS
+            else:
+                v_vel = SCAN_SPEED_FAR_DPS
+
+            print(f"\n{label} col {col_idx + 1}/{total_cols}  "
+                  f"H={h_col:.2f}°  V: {v_start:.1f}°→{v_end:.1f}°  {v_vel:.1f} dps")
+
+            # Blocking position: step H to column.
+            # With zigzag V is already at v_start after the previous column's sweep,
+            # so only H needs to move (except on the very first column).
+            mbx.set_velocity(SCAN_SPEED_FAR_DPS, SCAN_SPEED_FAR_DPS, 0)
+            if col_idx == 0:
+                mbx.move_angle(hang=h_col, vang=self._guard_v(v_start), accuracy="HIGH")
+            else:
+                mbx.move_angle(hang=h_col, accuracy="HIGH")   # V already at v_start
+            self._assert_v_in_bounds()
+
+            # Non-blocking V fly-by — motor moves while VNA is sampled
+            v_goal_pos = mbx.convertangletopos(mbx.V, v_end)
+            mbx.set_velocity(0, v_vel, 0)   # H fixed, V at scan speed
+            mbx.move_pos(mbx.V, v_goal_pos)
+
+            while True:
+                cur_v_pos = mbx.current_pos(mbx.V, 1)
+                cur_v_ang = mbx.convertpostoangle(mbx.V, cur_v_pos)
+                self._assert_v_in_bounds()              # reactive V limit fallback
+
+                try:
+                    data = self.measure()
+                    db_vals = data.get("db", [])
+                    peak = max(db_vals) if db_vals else float("-inf")
+                except Exception:
+                    peak = float("-inf")
+
                 if peak > best_db:
                     best_db = peak
-                    best_h = h
-                    best_v = v
-                print(
-                    f"  [{count:4d}/{total}] H:{h:7.2f}  V:{v:7.2f}  {peak:7.2f} dB"
-                    f"  (best H:{best_h:.2f}  V:{best_v:.2f}  {best_db:.2f} dB)"
-                )
+                    best_h = h_col
+                    best_v = cur_v_ang                  # live encoder position at peak
 
-        mbx.set_velocity(0, 0, 0)
+                print(f"  H:{h_col:7.2f}°  V:{cur_v_ang:7.2f}°  {peak:7.2f} dB"
+                      f"  (best H:{best_h:.2f}°  V:{best_v:.2f}°  {best_db:.2f} dB)")
+
+                if abs(v_goal_pos - cur_v_pos) <= done_tol_v:
+                    break
+
+            mbx.set_velocity(0, 0, 0)
+            sweep_up = not sweep_up     # reverse V direction for next column
+
         return best_h, best_v, best_db
 
     def run_scan(self, coarse_step=45.0, fine_step=11.25):
@@ -760,15 +849,15 @@ class GimbalController:
         print("Starting coarse scan (45 deg steps)...")
         best_h, best_v, best_db = self._grid_scan(
             -180.0, 180.0, coarse_step,
-            -180.0, 180.0, coarse_step,
+            self._v_abs_min, self._v_abs_max, coarse_step,
             "Coarse"
         )
         print(f"\nCoarse peak: H={best_h:.2f}  V={best_v:.2f}  {best_db:.2f} dB")
 
         h_lo = max(-180.0, best_h - coarse_step)
         h_hi = min(180.0, best_h + coarse_step)
-        v_lo = max(-180.0, best_v - coarse_step)
-        v_hi = min(180.0, best_v + coarse_step)
+        v_lo = max(self._v_abs_min, best_v - coarse_step)
+        v_hi = min(self._v_abs_max, best_v + coarse_step)
 
         print(f"\nStarting fine scan ({fine_step} deg steps around peak)...")
         best_h, best_v, best_db = self._grid_scan(
@@ -784,7 +873,8 @@ class GimbalController:
             print("Simulated beam center expected at H=0.00, V=0.00 deg")
             print("Position error vs simulated center: dH=%+.2f deg, dV=%+.2f deg" % (err_h, err_v))
         print("Moving the gimbal to that VNA peak direction...")
-        mbx.move_angle(hang=best_h, vang=best_v, accuracy="HIGH")
+        mbx.move_angle(hang=best_h, vang=self._guard_v(best_v), accuracy="HIGH")
+        self._assert_v_in_bounds()
         self._print_position()
         try:
             data = self.measure()
@@ -792,7 +882,7 @@ class GimbalController:
             print(f"Confirmed VNA peak power at this location: {peak_db:.2f} dB")
         except Exception as exc:
             print(f"Peak confirmation read failed: {exc}")
-        print("\nParked at the strongest measured VNA direction. Entering keyboard control -- Q/ESC to quit & home.")
+        print("\nParked at the strongest measured VNA direction. Entering keyboard control -- Q/ESC to quit.")
         self.run_keyboard_control(start_h=best_h, start_v=best_v)
 
     def run_adaptive_scan(self):
@@ -843,7 +933,7 @@ class GimbalController:
         except Exception:
             pass
 
-        mbx.move_angle(vang=0.0, hang=-180.0, accuracy="HIGH")
+        mbx.move_angle(vang=self._guard_v(0.0), hang=-180.0, accuracy="HIGH")
         time.sleep(0.1)
 
         best_h = -180.0
@@ -889,11 +979,11 @@ class GimbalController:
 
         # Continuous V sweep around the best H found above, using the same adaptive speed logic.
         print("\nNow sweeping V continuously around the best H found from the H scan...")
-        mbx.move_angle(hang=best_h, vang=-180.0, accuracy="HIGH")
+        mbx.move_angle(hang=best_h, vang=self._v_abs_min, accuracy="HIGH")
         time.sleep(0.1)
 
-        v_goal_pos = mbx.convertangletopos(mbx.V, 180.0)
-        mbx.set_velocity(0, _speed_for_v(-180.0), 0)
+        v_goal_pos = mbx.convertangletopos(mbx.V, self._v_abs_max)
+        mbx.set_velocity(0, _speed_for_v(self._v_abs_min), 0)
         mbx.move_pos(mbx.V, v_goal_pos)
 
         done_tol_pos_v = abs(mbx.convertangletopos(mbx.V, 1.0) - mbx.convertangletopos(mbx.V, 0.0))
@@ -904,6 +994,7 @@ class GimbalController:
         while True:
             cur_v_pos = mbx.current_pos(mbx.V, 1)
             cur_v_ang = mbx.convertpostoangle(mbx.V, cur_v_pos)
+            self._assert_v_in_bounds()                 # reactive fallback
             try:
                 data = self.measure()
                 db_vals = data.get("db", [])
@@ -927,7 +1018,8 @@ class GimbalController:
             time.sleep(0.05)
 
         mbx.set_velocity(0, 0, 0)
-        mbx.move_angle(hang=best_h, vang=best_v, accuracy="HIGH")
+        mbx.move_angle(hang=best_h, vang=self._guard_v(best_v), accuracy="HIGH")
+        self._assert_v_in_bounds()
         self._print_position()
         elapsed = time.time() - t0
         print(f"\nPeak found from continuous adaptive sweep: H={best_h:.2f}  V={best_v:.2f}  {best_db:.2f} dB")
@@ -940,7 +1032,7 @@ class GimbalController:
         print("Parked at the strongest measured VNA direction.")
         self.run_keyboard_control(start_h=best_h, start_v=best_v)
 
-    def run_velocity_scan(self, kv=1.6, v_min=1.0, v_max=14.6,
+    def run_velocity_scan(self, kv=0.8, v_min=0.5, v_max=5.0,
                           poll_interval=0.05, tolerance=0.1, plot=True):
         """Proportional-velocity VNA scan + precision park at the measured peak.
 
@@ -987,7 +1079,7 @@ class GimbalController:
         except Exception:
             pass
 
-        mbx.move_angle(vang=0.0, hang=-270.0, accuracy="HIGH")
+        mbx.move_angle(vang=self._guard_v(0.0), hang=-270.0, accuracy="HIGH")
         time.sleep(0.1)
 
         best_h = -270.0
@@ -1008,7 +1100,8 @@ class GimbalController:
             if _scan_aborted():
                 print("\n*** Scan aborted (Q/ESC) ***")
                 mbx.set_velocity(0, 0, 0)
-                self.home()
+                print("Gimbal parked at current position — no automatic movement.")
+                self._print_position()
                 return
             cur_h_pos = mbx.current_pos(mbx.H, 1)
             cur_h_ang = mbx.convertpostoangle(mbx.H, cur_h_pos)
@@ -1046,7 +1139,7 @@ class GimbalController:
         print(f"\nPhase 2: V sweep at H={best_h:.2f}°  hint={target_v:.2f}°  "
               f"vel = clamp({kv}×|V−{target_v:.1f}°|, {v_min}, {v_max}) dps")
 
-        mbx.move_angle(hang=best_h, vang=-180.0, accuracy="HIGH")
+        mbx.move_angle(hang=best_h, vang=self._v_abs_min, accuracy="HIGH")
         time.sleep(0.1)
 
         v_scan_ang = []
@@ -1056,18 +1149,18 @@ class GimbalController:
         if done_tol_v < 1:
             done_tol_v = 1
 
-        v_goal_pos = mbx.convertangletopos(mbx.V, 180.0)
-        mbx.set_velocity(0, _vel(-180.0, target_v), 0)
+        v_goal_pos = mbx.convertangletopos(mbx.V, self._v_abs_max)
+        mbx.set_velocity(0, _vel(self._v_abs_min, target_v), 0)
         mbx.move_pos(mbx.V, v_goal_pos)
 
         while True:
             if _scan_aborted():
                 print("\n*** Scan aborted (Q/ESC) ***")
                 mbx.set_velocity(0, 0, 0)
-                self.home()
                 return
             cur_v_pos = mbx.current_pos(mbx.V, 1)
             cur_v_ang = mbx.convertpostoangle(mbx.V, cur_v_pos)
+            self._assert_v_in_bounds()                 # reactive fallback
             try:
                 db_vals = self.measure().get("db", [])
                 peak = max(db_vals) if db_vals else float("-inf")
@@ -1112,11 +1205,11 @@ class GimbalController:
             self._plot_scan_results(h_scan_ang, h_scan_db, v_scan_ang, v_scan_db,
                                      best_h, best_v, park_log)
 
-        print("\nParked at VNA peak. Entering keyboard control — Q/ESC to quit & home.")
+        print("\nParked at VNA peak. Entering keyboard control — Q/ESC to quit.")
         self.run_keyboard_control(start_h=best_h, start_v=best_v)
 
     def run_continuous_sweep(self, minh=-180.0, maxh=180.0, step=1.0,
-                             vert=0.0, h_speed_dps=10.0, settle=0.2,
+                             vert=0.0, h_speed_dps=5.0, settle=0.2,
                              plot_freq=None, tag="continuous", validonly=True,
                              plot=1):
         """Continuous H-sweep capture that writes raw VNA power vs angle to CSV.
@@ -1163,7 +1256,7 @@ class GimbalController:
             print(f"\n**** Plotting frequency = {freq[freq_idx] / 1.0e9:.3f} GHz ****\n")
             capture.writerow(["t", "actual_H", "actual_V"] + list(freq))
 
-            mbx.move_angle(vang=vert, hang=minh, accuracy="HIGH")
+            mbx.move_angle(vang=self._guard_v(vert), hang=minh, accuracy="HIGH")
             try:
                 self._vna.fix_status()
             except Exception:
@@ -1211,7 +1304,6 @@ class GimbalController:
             except Exception:
                 pass
             mbx.set_velocity(0, 0, 0)
-            mbx.gotoZERO("HIGH")
 
             if aborted:
                 print("*** Sweep aborted by user ***")
@@ -1243,7 +1335,7 @@ class GimbalController:
             print(f"\nCaptured {len(samples_ang)} points over {span:.1f} deg  ->  {len(samples_ang) / max(span, 1e-9):.2f} samples/deg")
             print(f"Peak from sweep: H={best_h:.3f} deg, V={vert:.3f} deg, P={best_db:.2f} dB")
             print("Moving gimbal to the sweep peak...")
-            mbx.move_angle(hang=best_h, vang=vert, accuracy="HIGH")
+            mbx.move_angle(hang=best_h, vang=self._guard_v(vert), accuracy="HIGH")
             self._print_position()
             print("Parked at the strongest point found from the captured data.")
             print(f"*** Elapsed = {datetime.timedelta(seconds=int(time.time() - t0))} ***")
@@ -1266,13 +1358,21 @@ class GimbalController:
         }
 
         step = 11.25
-        h = start_h
-        v = start_v
         prev_m = False
         prev_a = False
         prev_s = False
 
-        print("Hold arrows/IJKL: continuous move  |  A/S: step  |  M: measure  |  Q/ESC: quit & home")
+        # Initialise from live encoder — not from the caller-supplied estimate,
+        # which is a commanded position and may differ from settled reality.
+        try:
+            _pos = self.position()
+            h = _pos["H"]
+            v = _pos["V"]
+        except Exception:
+            h = float(start_h)
+            v = float(start_v)
+
+        print("Hold arrows/IJKL: continuous move  |  A/S: step  |  M: measure  |  Q/ESC: quit")
         print(f"Step: {step}")
         self._print_position()
 
@@ -1308,14 +1408,24 @@ class GimbalController:
             if held(VK["down"])  or held(VK["k"]): dv -= step
 
             if dh != 0.0 or dv != 0.0:
-                h = max(-180.0, min(180.0, h + dh))
-                v = max(-180.0, min(180.0, v + dv))
+                # Read live encoder for each move so the delta is applied to the
+                # actual settled position, not a software-tracked estimate.
+                try:
+                    _pos = self.position()
+                    h = _pos["H"]
+                    v = _pos["V"]
+                except Exception:
+                    pass                               # keep last known value on read error
+                h = h + dh
+                v = self._guard_v(v + dv)             # proactive clamp against session limits
                 mbx.move_angle(hang=h, vang=v, accuracy="HIGH")
+                self._assert_v_in_bounds()             # reactive fallback
                 self._print_position()
             else:
                 time.sleep(0.02)
 
-        self.home()
+        print("Stopped. Gimbal parked at current position.")
+        self._print_position()
 
     def _print_position(self):
         try:
@@ -1356,10 +1466,8 @@ class GimbalController:
         self._require_connection()
         if h is None and v is None:
             raise ValueError("At least one of h or v must be provided")
-        if h is not None:
-            self._validate_angle("H", h)
         if v is not None:
-            self._validate_angle("V", v)
+            v = self._guard_v(v)                       # proactive clamp
 
         pos = self.position()
         h_target = float(h) if h is not None else pos["H"]
@@ -1409,6 +1517,8 @@ class GimbalController:
                     f"  {v_act:+10.3f}°  {v_err:+9.3f}°  {vel_v:7.2f}"
                 )
 
+            self._assert_v_in_bounds()                 # reactive fallback each tick
+
             if abs(h_err) <= tolerance and abs(v_err) <= tolerance:
                 settled += 1
                 if settled >= 3:
@@ -1433,6 +1543,7 @@ class GimbalController:
             print(f"\n  Fine-settle (VERY HIGH accuracy — overshoot + backlash correction)...")
         mbx.set_velocity(0, 0, 0)  # 0 → max velocity for the settle move
         mbx.move_angle(hang=h_target, vang=v_target, accuracy="VERY HIGH")
+        self._assert_v_in_bounds()                     # reactive fallback after settle
 
         elapsed = time.time() - t0
         h_act = mbx.convertpostoangle(mbx.H, mbx.current_pos(mbx.H, 1))
@@ -1577,10 +1688,10 @@ class GimbalController:
     def close(self):
         if self._connected:
             try:
-                mbx.gotoZERO(accuracy="HIGH")
-            finally:
                 mbx.close()
-                self._connected = False
+            except Exception:
+                pass
+            self._connected = False
         if self._vna is not None:
             try:
                 self._vna.close_instrument()
@@ -1590,10 +1701,6 @@ class GimbalController:
 
     def _on_exit(self):
         if self._connected:
-            try:
-                mbx.gotoZERO(accuracy="HIGH")
-            except Exception:
-                pass
             try:
                 mbx.close()
             except Exception:
