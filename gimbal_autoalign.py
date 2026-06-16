@@ -17,6 +17,9 @@ _BAUD = 1000000
 # V-axis absolute travel limits (degrees from motor mechanical zero)
 V_LIMIT_LOWER = -60.0           # absolute lower bound for V axis
 V_LIMIT_UPPER =  60.0           # absolute upper bound for V axis
+# Inward margin on every continuous V sweep endpoint — prevents overshoot past the hard
+# limit from motor inertia (move_pos) and the SDK overshoot-then-return in move_angle HIGH.
+V_SWEEP_MARGIN_DEG = 3.0
 
 # Adaptive sweep speed settings — tuned for a 1 kg antenna load
 SCAN_SPEED_NEAR_DPS  = 2.0      # slow speed near the target angle
@@ -520,12 +523,15 @@ class GimbalController:
         # Fixed absolute V limits — independent of power-on position
         self._v_abs_min = V_LIMIT_LOWER
         self._v_abs_max = V_LIMIT_UPPER
+        # Sweep endpoints are inset by the margin to absorb motor overshoot
+        self._v_sweep_min = V_LIMIT_LOWER + V_SWEEP_MARGIN_DEG
+        self._v_sweep_max = V_LIMIT_UPPER - V_SWEEP_MARGIN_DEG
         # Propagate into the MBX motion table so mbx.move_angle() also enforces the limits
         mbx.get_gim_motion()[2]["anglelim"] = [self._v_abs_min, self._v_abs_max]
 
         # H=16 keeps azimuth snappy; V=4 gives a long ramp to reduce jerk under 1 kg load
         try:
-            mbx.set_accel(16, 4, 10)
+            mbx.set_accel(16, 2, 10)
         except Exception:
             pass
 
@@ -758,8 +764,8 @@ class GimbalController:
 
     def _grid_scan(self, h_lo, h_hi, h_step, v_lo, v_hi, v_step, label, target_h=None):
         # Clip V range to session limits
-        v_lo = max(v_lo, self._v_abs_min)
-        v_hi = min(v_hi, self._v_abs_max)
+        v_lo = max(v_lo, self._v_sweep_min)
+        v_hi = min(v_hi, self._v_sweep_max)
         if v_lo >= v_hi:
             print(f"*** {label}: V range is entirely outside limits "
                   f"[{self._v_abs_min:.1f}°, {self._v_abs_max:.1f}°] — scan skipped")
@@ -968,12 +974,12 @@ class GimbalController:
         mbx.move_angle(hang=0.0, vang=self._guard_v(0.0), accuracy="HIGH")
         time.sleep(0.1)
 
-        print(f"\nPhase 2: V sweep [{self._v_abs_min:.1f}°, {self._v_abs_max:.1f}°] at H=0°")
-        mbx.move_angle(hang=0.0, vang=self._guard_v(self._v_abs_min), accuracy="HIGH")
+        print(f"\nPhase 2: V sweep [{self._v_sweep_min:.1f}°, {self._v_sweep_max:.1f}°] at H=0°")
+        mbx.move_angle(hang=0.0, vang=self._guard_v(self._v_sweep_min), accuracy="HIGH")
         time.sleep(0.1)
 
-        v_goal_pos = mbx.convertangletopos(mbx.V, self._v_abs_max)
-        mbx.set_velocity(0, _speed_for_v(self._v_abs_min), 0)
+        v_goal_pos = mbx.convertangletopos(mbx.V, self._v_sweep_max)
+        mbx.set_velocity(0, _speed_for_v(self._v_sweep_min), 0)
         mbx.move_pos(mbx.V, v_goal_pos)
 
         done_tol_pos_v = abs(mbx.convertangletopos(mbx.V, 1.0) - mbx.convertangletopos(mbx.V, 0.0))
@@ -1123,10 +1129,10 @@ class GimbalController:
         time.sleep(0.1)
 
         # ---- Phase 2: V sweep at H=0 ----
-        print(f"\nPhase 2: V sweep [{self._v_abs_min:.1f}°, {self._v_abs_max:.1f}°] at H=0°  "
+        print(f"\nPhase 2: V sweep [{self._v_sweep_min:.1f}°, {self._v_sweep_max:.1f}°] at H=0°  "
               f"vel = clamp({kv}×|V|, {v_min}, {v_max}) dps — slower near boresight (0°)")
 
-        mbx.move_angle(hang=0.0, vang=self._guard_v(self._v_abs_min), accuracy="HIGH")
+        mbx.move_angle(hang=0.0, vang=self._guard_v(self._v_sweep_min), accuracy="HIGH")
         time.sleep(0.1)
 
         v_scan_ang = []
@@ -1136,8 +1142,8 @@ class GimbalController:
         if done_tol_v < 1:
             done_tol_v = 1
 
-        v_goal_pos = mbx.convertangletopos(mbx.V, self._v_abs_max)
-        mbx.set_velocity(0, _vel(self._v_abs_min, target_v), 0)
+        v_goal_pos = mbx.convertangletopos(mbx.V, self._v_sweep_max)
+        mbx.set_velocity(0, _vel(self._v_sweep_min, target_v), 0)
         mbx.move_pos(mbx.V, v_goal_pos)
 
         while True:
