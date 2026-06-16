@@ -531,7 +531,7 @@ class GimbalController:
 
         # H=16 keeps azimuth snappy; V=4 gives a long ramp to reduce jerk under 1 kg load
         try:
-            mbx.set_accel(16, 2, 10)
+            mbx.set_accel(24, 1.5, 10)
         except Exception:
             pass
 
