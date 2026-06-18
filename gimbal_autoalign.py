@@ -3,6 +3,12 @@ import atexit
 import ctypes
 import time
 
+try:
+    from simple_pid import PID as _PID
+    _HAVE_SIMPLE_PID = True
+except ImportError:
+    _HAVE_SIMPLE_PID = False
+
 sys.path.insert(0, r"C:\Users\uconn\Downloads\Millibox Gimbal Files (1)\Millibox Gimbal Files\SWMilliBox\MBX\python")
 import mbx_functions as mbx
 import mbx_instrument as equip
@@ -77,6 +83,55 @@ def _read_angle(motor):
     return mbx.convertpostoangle(motor, mbx.current_pos(motor, 1))
 
 
+class _PIDAxis:
+    """Per-axis gradient PID for beam alignment and tracking.
+
+    Uses simple_pid.PID when available (installed as simple-pid), otherwise falls back
+    to an equivalent inline implementation. Setpoint is always 0 — the gradient is zero
+    at the beam peak. Input is gradient in dB/degree; output is an angular correction in
+    degrees, clamped to ±output_limit to prevent large jumps that would cause jerky motion.
+    """
+
+    def __init__(self, kp=0.6, ki=0.04, kd=0.08, output_limit=5.0):
+        if _HAVE_SIMPLE_PID:
+            self._pid = _PID(Kp=kp, Ki=ki, Kd=kd,
+                             setpoint=0.0,
+                             output_limits=(-output_limit, output_limit),
+                             sample_time=None)
+            self._use_lib = True
+        else:
+            self._kp, self._ki, self._kd = kp, ki, kd
+            self._limit = output_limit
+            self._integral = 0.0
+            self._prev_grad = None
+            self._use_lib = False
+
+    def step(self, gradient):
+        """Return angular correction (deg) for gradient signal (dB/deg).
+
+        Positive gradient → peak is in the + direction → positive correction.
+        """
+        if self._use_lib:
+            # Pass -gradient so simple_pid error = setpoint - (-gradient) = gradient,
+            # giving output = Kp*gradient (move toward the peak, not away from it).
+            return self._pid(-gradient)
+        self._integral += gradient
+        d = (gradient - self._prev_grad) if self._prev_grad is not None else 0.0
+        self._prev_grad = gradient
+        output = self._kp * gradient + self._ki * self._integral + self._kd * d
+        if abs(output) >= self._limit:
+            self._integral -= gradient   # anti-windup: undo accumulation when saturated
+            output = _clamp(output, -self._limit, self._limit)
+        return output
+
+    def reset(self):
+        if self._use_lib:
+            self._pid.reset()
+        else:
+            self._integral = 0.0
+            self._prev_grad = None
+
+
 def _parabola_vertex(x1, y1, x2, y2, x3, y3):
     """Fit y = a*x^2 + b*x + c through three (x, y) samples and return the vertex x.
 
@@ -148,6 +203,46 @@ def _refine_axis(meas, move_to, center_angle, center_power, probe, max_move, mot
     return target, best_power, 2
 
 
+def _refine_axis_pid(meas, move_to, center_angle, center_power, probe, max_move, motor, pid):
+    """PID-corrected axis refinement — same two probe moves as _refine_axis, but the
+    gradient feeds a _PIDAxis instance that accumulates integral and derivative state
+    across successive passes.
+
+    I-term corrects sustained pointing offset (cable drag, mechanical bias).
+    D-term damps oscillation when the gradient flips sign between passes.
+    The output is bounded by pid.output_limit so no single pass makes a large jump.
+
+    Falls back to the best raw sample and resets PID state if the VNA returns no data.
+    Returns (target_angle, best_power_seen, n_probe_moves).
+    """
+    lo, hi = _angle_limits(motor)
+    a_minus = _clamp(center_angle - probe, lo, hi)
+    a_plus  = _clamp(center_angle + probe, lo, hi)
+
+    move_to(a_minus); p_minus = meas()
+    move_to(a_plus);  p_plus  = meas()
+
+    samples = [(center_angle, center_power), (a_minus, p_minus), (a_plus, p_plus)]
+    samples = [s for s in samples if s[1] is not None]
+    if not samples:
+        pid.reset()
+        return center_angle, None, 2
+    best_angle, best_power = max(samples, key=lambda s: s[1])
+
+    if p_minus is not None and p_plus is not None:
+        span = a_plus - a_minus
+        if span > 0:
+            grad       = (p_plus - p_minus) / span          # dB/deg — zero at peak
+            correction = pid.step(grad)                      # PID output: deg toward peak
+            target     = _clamp(center_angle + correction,
+                                center_angle - max_move, center_angle + max_move)
+            target     = _clamp(target, lo, hi)
+            return target, best_power, 2
+
+    pid.reset()
+    return best_angle, best_power, 2
+
+
 # ======================================================================================================================
 #  CONTINUOUS-SWEEP AXIS REFINEMENT
 # ======================================================================================================================
@@ -172,15 +267,53 @@ def _sweep_axis_continuous(meas, move_to, motor, center_angle, probe, max_move):
     mbx.write_accel()                                       # re-enforce _ACCEL_SCALE ramps before sweep
     mbx.move_pos(motor, pos_end)                            # kick off sweep non-blocking
 
-    samples = []
+    samples  = []
+    _t_ang   = []    # (time, angle) for velocity estimation — not returned
+    _WIN     = 4     # samples to average over per velocity window
+    _v_peak  = 0.0
+    _cruise_printed = False
+    _decel_printed  = False
+
+    def _wv(end):
+        """Mean angular speed (deg/s) over the _WIN samples ending at index `end`."""
+        start = max(0, end - _WIN + 1)
+        if end <= start:
+            return 0.0
+        t0, a0 = _t_ang[start]
+        t1, a1 = _t_ang[end]
+        dt = t1 - t0
+        return abs(a1 - a0) / dt if dt > 1e-4 else 0.0
+
     while mbx.check_is_moving():
         try:
             angle = mbx.convertpostoangle(motor, mbx.current_pos(motor, 1))
+            _t_ang.append((time.time(), angle))
             p = meas()
             if p is not None:
                 samples.append((angle, p))
         except Exception:
             pass
+
+        n = len(_t_ang) - 1
+        if n >= _WIN * 2:
+            v_now  = _wv(n)
+            v_prev = _wv(n - _WIN)
+            if v_now > _v_peak:
+                _v_peak = v_now
+
+            if (not _cruise_printed and _v_peak > 0.2
+                    and abs(v_now - v_prev) < 0.08 * _v_peak):
+                angle_now = _t_ang[n][1]
+                print(f" P1: {v_now:.2f} °/s  at {angle_now:.2f}°")
+                GimbalController._print_position()
+                _cruise_printed = True
+
+            if (not _decel_printed and _cruise_printed
+                    and v_now < _v_peak * 0.90):
+                angle_now = _t_ang[n][1]
+                print(f" P2:  {v_now:.2f} °/s  at {angle_now:.2f}°")
+                GimbalController._print_position()
+                _decel_printed = True
 
     try:                                                    # one final sample at rest
         angle = mbx.convertpostoangle(motor, mbx.current_pos(motor, 1))
@@ -223,7 +356,8 @@ def _beam_align_pass_loop(meas, move1, move2, motor1, motor2,
                            max_move, tol_db, tol_ang,
                            continuous1, continuous2,
                            axis1_name, axis2_name, gimbal_label,
-                           inst, verbose):
+                           inst, verbose,
+                           pid1=None, pid2=None):
     """Iterative probe-and-refine loop shared by HV and spherical alignment.
 
     Returns (best1, best2, best_p, passes_used, total_moves) on success, or
@@ -253,6 +387,8 @@ def _beam_align_pass_loop(meas, move1, move2, motor1, motor2,
 
         if continuous1:
             t1, _, n1 = _sweep_axis_continuous(meas, move1, motor1, a1, probe, max_move)
+        elif pid1 is not None:
+            t1, _, n1 = _refine_axis_pid(meas, move1, a1, p_cur, probe, max_move, motor1, pid1)
         else:
             t1, _, n1 = _refine_axis(meas, move1, a1, p_cur, probe, max_move, motor1)
         move1(t1)
@@ -261,6 +397,8 @@ def _beam_align_pass_loop(meas, move1, move2, motor1, motor2,
 
         if continuous2:
             t2, _, n2 = _sweep_axis_continuous(meas, move2, motor2, a2, probe, max_move)
+        elif pid2 is not None:
+            t2, _, n2 = _refine_axis_pid(meas, move2, a2, p_after1, probe, max_move, motor2, pid2)
         else:
             t2, _, n2 = _refine_axis(meas, move2, a2, p_after1, probe, max_move, motor2)
         move2(t2)
@@ -301,12 +439,18 @@ def beam_align_hv_directmotion(inst, pangle=0.0, accuracy="VERY HIGH",
                                probe_decay=0.5, max_move=60.0,
                                tol_db=0.05, tol_ang=0.10,
                                start_h=None, start_v=None, verbose=True,
-                               measure_fn=None, continuous=False):
+                               measure_fn=None, continuous=False,
+                               use_pid=False, pid_kp=0.6, pid_ki=0.04, pid_kd=0.08):
     """Closed-loop HV gimbal alignment using direct-motion probes and parabola fits.
 
     continuous=True: each axis is swept without stopping while VNA samples are
     collected in flight; a parabola is fit to the captured samples to find the vertex.
     continuous=False (default): classic discrete probe-stop-measure behaviour.
+
+    use_pid=True: replaces the single-pass parabola fit with a _PIDAxis controller
+    that accumulates integral and derivative state across passes. Automatically
+    forces continuous=False (PID needs per-step discrete measurements). The I-term
+    corrects sustained pointing offset; the D-term damps pass-to-pass oscillation.
 
     Returns (H_off, V_off) or (None, None) on error.
     """
@@ -340,6 +484,13 @@ def beam_align_hv_directmotion(inst, pangle=0.0, accuracy="VERY HIGH",
     move_v(_clamp_angle(V, v0))
     p_cur = meas()
 
+    if use_pid:
+        continuous = False   # PID needs discrete per-step measurements
+        pid1 = _PIDAxis(pid_kp, pid_ki, pid_kd)
+        pid2 = _PIDAxis(pid_kp, pid_ki, pid_kd)
+    else:
+        pid1 = pid2 = None
+
     best_h, best_v, best_p, passes_used, total_moves = _beam_align_pass_loop(
         meas, move_h, move_v, H, V, h0, v0, p_cur,
         max_passes, init_probe, min_probe, probe_decay, max_move,
@@ -347,6 +498,7 @@ def beam_align_hv_directmotion(inst, pangle=0.0, accuracy="VERY HIGH",
         continuous1=continuous, continuous2=continuous,
         axis1_name="H", axis2_name="V", gimbal_label="HV",
         inst=inst, verbose=verbose,
+        pid1=pid1, pid2=pid2,
     )
 
     if best_h is None:
@@ -385,12 +537,16 @@ def beam_align_sph_directmotion(inst, accuracy="VERY HIGH",
                                 probe_decay=0.5, max_move=60.0,
                                 tol_db=0.05, tol_ang=0.10,
                                 start_th=None, start_ph=None, verbose=True,
-                                measure_fn=None, continuous=False):
+                                measure_fn=None, continuous=False,
+                                use_pid=False, pid_kp=0.6, pid_ki=0.04, pid_kd=0.08):
     """Closed-loop direct-motion alignment for a SPHERICAL gimbal (theta = TH, phi = PH).
 
     continuous=True: TH axis swept without stopping (same as HV). PH axis stays
     discrete because it drives two motors (T+Z) whose combined position is a list,
     not a scalar angle, which the sweep sampler cannot handle.
+
+    use_pid=True: same PID gradient control as the HV variant (see beam_align_hv_directmotion).
+    Forces continuous=False on both axes.
     """
     if mbx.gim_type != SPHERICAL:
         print("*** ERROR: gimbal is not SPHERICAL - use beam_align_hv_directmotion() instead")
@@ -421,6 +577,13 @@ def beam_align_sph_directmotion(inst, accuracy="VERY HIGH",
     move_ph(phi0)
     p_cur = meas()
 
+    if use_pid:
+        continuous = False
+        pid1 = _PIDAxis(pid_kp, pid_ki, pid_kd)
+        pid2 = _PIDAxis(pid_kp, pid_ki, pid_kd)
+    else:
+        pid1 = pid2 = None
+
     best_th, best_ph, best_p, passes_used, total_moves = _beam_align_pass_loop(
         meas, move_th, move_ph, TH, PH, th0, phi0, p_cur,
         max_passes, init_probe, min_probe, probe_decay, max_move,
@@ -428,6 +591,7 @@ def beam_align_sph_directmotion(inst, accuracy="VERY HIGH",
         continuous1=continuous, continuous2=False,
         axis1_name="TH", axis2_name="PHI", gimbal_label="SPHERICAL",
         inst=inst, verbose=verbose,
+        pid1=pid1, pid2=pid2,
     )
 
     if best_th is None:
@@ -687,13 +851,20 @@ class GimbalController:
 
     def run_direct_align(self, max_passes=5, init_probe=8.0, min_probe=0.5,
                          max_move=60.0, accuracy="VERY HIGH", pangle=0.0,
-                         freq_mode="mid", enter_keyboard=True):
+                         freq_mode="mid", enter_keyboard=True,
+                         use_pid=False, enter_track=False):
         """Point the gimbal at the direction of maximum VNA signal using closed-loop
         direct motion (no full grid sweep, <= max_passes correction passes).
 
         All motion goes through mbx.move_angle over the COM link; feedback comes from
         this controller's measure() pipeline via the injected measure_fn. The gimbal is
         left parked at the located peak.
+
+        use_pid=True  — use PID gradient control instead of single-pass parabola fit.
+                        Automatically switches to discrete probe mode. Recommended when
+                        the beam has a mechanical pointing bias that accumulates over passes.
+        enter_track=True — after alignment, enter run_track() to hold the peak
+                           continuously. Implies enter_keyboard=False.
 
         Returns (H, V) of the peak, or None if it could not complete.
         """
@@ -733,7 +904,8 @@ class GimbalController:
             max_move=max_move,
             pangle=pangle,                              # HV only; ignored for spherical
             verbose=True,
-            continuous=True,
+            continuous=not use_pid,                     # PID needs discrete probe mode
+            use_pid=use_pid,
         )
 
         # beam_align_directmotion returns a 2-tuple for both HV (H,V) and spherical (TH,PHI)
@@ -753,7 +925,10 @@ class GimbalController:
         if _log:
             self._plot_alignment(_log, _freqs)
 
-        if enter_keyboard:
+        if enter_track:
+            print("\nAlignment complete. Entering PID tracker — Q/ESC/X to stop and hold position.")
+            self.run_track()
+        elif enter_keyboard:
             print("\nParked at peak. Entering keyboard control -- Q/ESC/X: quit & hold position  |  H: go home")
             self.run_keyboard_control(start_h=a, start_v=b)
         return a, b
@@ -997,6 +1172,98 @@ class GimbalController:
 
         self._print_position()
         print("Holding position — motors remain engaged.")
+
+    def run_track(self, dither=0.5, kp=0.6, ki=0.04, kd=0.08,
+                  output_limit=2.0, interval=0.2):
+        """Continuously track the beam peak after initial alignment.
+
+        Each cycle probes ±dither degrees on each axis, estimates the gradient, and
+        applies a PID correction to hold the gimbal at the power maximum. Corrections
+        are bounded to ±output_limit degrees per cycle so the motion stays smooth with
+        no sudden jumps. The existing motor velocity and acceleration caps (_ACCEL_SCALE)
+        further ensure gentle ramps between probe points.
+
+        dither:       half-amplitude of the probe step (degrees, default 0.5)
+        output_limit: maximum single-cycle angular correction (degrees, default 2.0)
+        interval:     seconds of sleep after each correction cycle (default 0.2)
+        kp/ki/kd:     PID gains — output in degrees, error in dB/degree
+
+        Press Q / ESC / X to stop tracking and hold the current position.
+        """
+        self._require_connection()
+        if self._vna is None:
+            raise RuntimeError("VNA not connected — call connect_vna() first")
+
+        _k = ctypes.windll.user32.GetAsyncKeyState
+        def held(vk): return bool(_k(vk) & 0x8000)
+        QUIT = [0x51, 0x1B, 0x58]  # Q, ESC, X
+
+        pid_h = _PIDAxis(kp, ki, kd, output_limit)
+        pid_v = _PIDAxis(kp, ki, kd, output_limit)
+
+        try:
+            pos = self.position()
+            h, v = pos["H"], pos["V"]
+        except Exception:
+            h, v = 0.0, 0.0
+
+        lo_h, hi_h = _angle_limits(H)
+        lo_v, hi_v = _angle_limits(V)
+
+        print(f"\nPID tracker active  dither={dither}°  max_correction={output_limit}°  interval={interval}s")
+        print("Q / ESC / X : stop tracking and hold position")
+
+        tick = 0
+        while True:
+            if any(held(vk) for vk in QUIT):
+                break
+
+            # H axis: probe at h±dither (V stays fixed), compute gradient, apply PID
+            h_lo = _clamp(h - dither, lo_h, hi_h)
+            h_hi = _clamp(h + dither, lo_h, hi_h)
+            span_h = h_hi - h_lo
+
+            mbx.move_angle(hang=h_lo, vang=v, accuracy="HIGH")
+            p_hm = self._align_measure()
+            mbx.move_angle(hang=h_hi, vang=v, accuracy="HIGH")
+            p_hp = self._align_measure()
+
+            if p_hm is not None and p_hp is not None and span_h > 0:
+                h = _clamp(h + pid_h.step((p_hp - p_hm) / span_h), lo_h, hi_h)
+            else:
+                pid_h.reset()
+
+            # V axis: probe at v±dither (H now at corrected value), apply PID
+            v_lo = _clamp(v - dither, lo_v, hi_v)
+            v_hi = _clamp(v + dither, lo_v, hi_v)
+            span_v = v_hi - v_lo
+
+            mbx.move_angle(hang=h, vang=v_lo, accuracy="HIGH")
+            p_vm = self._align_measure()
+            mbx.move_angle(hang=h, vang=v_hi, accuracy="HIGH")
+            p_vp = self._align_measure()
+
+            if p_vm is not None and p_vp is not None and span_v > 0:
+                v = _clamp(v + pid_v.step((p_vp - p_vm) / span_v), lo_v, hi_v)
+            else:
+                pid_v.reset()
+
+            # move to PID-corrected position
+            mbx.move_angle(hang=h, vang=v, accuracy="HIGH")
+
+            tick += 1
+            try:
+                pos = self.position()
+                p = self._align_measure()
+                p_str = f"{p:.2f} dB" if p is not None else "---"
+                print(f"  [{tick:4d}]  H={pos['H']:+.3f}°  V={pos['V']:+.3f}°  P={p_str}")
+            except Exception:
+                pass
+
+            time.sleep(interval)
+
+        self._print_position()
+        print("Tracker stopped — holding position.")
 
     def _print_position(self):
         try:
@@ -1447,10 +1714,12 @@ if __name__ == "__main__":
         print("  7 - 40° cross-sweep: H then V (SIMULATED VNA)")
         print("  8 - 80° radiation-pattern sweep: home → H ±40° → V ±40° (Anritsu MS46322B)")
         print("  9 - 80° radiation-pattern sweep: home → H ±40° → V ±40° (SIMULATED VNA)")
-        choice = input("Enter 1-9: ").strip()
-        if choice in ("1", "2", "3", "4", "5", "6", "7", "8", "9"):
+        print(" 10 - PID alignment + continuous PID tracker (Anritsu MS46322B)")
+        print(" 11 - PID alignment + continuous PID tracker (SIMULATED VNA)")
+        choice = input("Enter 1-11: ").strip()
+        if choice in ("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"):
             break
-        print("Invalid input -- enter 1-9.")
+        print("Invalid input -- enter 1-11.")
 
     with GimbalController(port="COM7") as gim:
         if choice == "2":
@@ -1477,5 +1746,11 @@ if __name__ == "__main__":
         elif choice == "9":
             gim.connect_simulated_vna()
             gim.run_radiation_sweep()
+        elif choice == "10":
+            gim.connect_vna("TCPIP0::192.168.6.150::9001::SOCKET")
+            gim.run_direct_align(use_pid=True, enter_track=True, enter_keyboard=False)
+        elif choice == "11":
+            gim.connect_simulated_vna()
+            gim.run_direct_align(use_pid=True, enter_track=True, enter_keyboard=False)
         else:
             gim.run_keyboard_control()
